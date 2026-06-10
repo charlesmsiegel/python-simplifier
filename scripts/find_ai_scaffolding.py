@@ -97,15 +97,16 @@ def _method_in_abstract_class(func_node, class_map):
 def _build_class_map(tree):
     """
     Return a dict mapping id(func_node) -> bool indicating whether that function
-    is a method inside an abstract class (ABC/ABCMeta/Protocol).
+    is a DIRECT method of an abstract class (ABC/ABCMeta/Protocol).
+
+    Only iterates node.body (direct children) rather than ast.walk, so helper
+    functions nested inside concrete methods of an ABC are NOT marked exempt.
     """
     result = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             is_abs = _class_is_abstract(node)
-            for item in ast.walk(node):
-                if item is node:
-                    continue
+            for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     result[id(item)] = is_abs
     return result
@@ -336,11 +337,29 @@ def detect(tree, filename, lines, ignore):
 
     # -----------------------------------------------------------------------
     # placeholder_value  (AST scan for string Constants)
+    # Skip docstring constants — the first Expr(Constant(str)) in the body of
+    # a Module, ClassDef, FunctionDef, or AsyncFunctionDef.
     # -----------------------------------------------------------------------
+    _docstring_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body:
+                first = body[0]
+                if (
+                    isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)
+                ):
+                    _docstring_ids.add(id(first.value))
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant):
             continue
         if not isinstance(node.value, str):
+            continue
+        if id(node) in _docstring_ids:
             continue
         if _is_placeholder_string(node.value):
             add(

@@ -82,9 +82,11 @@ def _is_assert_call(node: ast.expr) -> bool:
         if attr.startswith("assert"):
             return True
     # pytest.raises / pytest.warns used as plain call (not `with`)
+    # Note: pytest.approx() on its own cannot fail a test — do NOT count it
+    # as an assertion.  It only has meaning inside a real assert statement.
     if isinstance(func, ast.Attribute):
         if isinstance(func.value, ast.Name) and func.value.id == "pytest":
-            if func.attr in ("raises", "warns", "approx"):
+            if func.attr in ("raises", "warns"):
                 return True
     if isinstance(func, ast.Name):
         name = func.id

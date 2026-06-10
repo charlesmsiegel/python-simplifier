@@ -16,6 +16,7 @@ import ast
 import sys
 import json
 import argparse
+import functools
 import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -222,13 +223,78 @@ def _is_stdlib(name: str) -> bool:
     return name in sys.stdlib_module_names
 
 
+@functools.lru_cache(maxsize=None)
+def _compute_local_packages(root: Path) -> frozenset:
+    """
+    Compute the set of local top-level package/module names for the project
+    rooted at `root`.  Cached per root (lru_cache) — no shared mutable state.
+
+    Includes:
+    - root/<name>.py  or root/<name>/__init__.py  (directly under root)
+    - root/src/<name>.py  or root/src/<name>/__init__.py  (src layout)
+    - The top-level package name of any __init__.py found anywhere under root
+      (skipping .venv / node_modules / __pycache__): walk up from the package
+      directory while the parent also contains __init__.py; the topmost such
+      directory's name is a local top-level package.
+    - Stems of all .py files sitting directly inside any "src" directory under
+      root.
+    """
+    names: set[str] = set()
+
+    # Direct children: root/<name>.py or root/<name>/__init__.py
+    for p in root.iterdir():
+        if p.suffix == ".py" and p.stem != "__init__":
+            names.add(p.stem)
+        elif p.is_dir() and (p / "__init__.py").exists():
+            names.add(p.name)
+
+    # src/ children: root/src/<name>.py or root/src/<name>/__init__.py
+    src_dir = root / "src"
+    if src_dir.is_dir():
+        for p in src_dir.iterdir():
+            if p.suffix == ".py" and p.stem != "__init__":
+                names.add(p.stem)
+            elif p.is_dir() and (p / "__init__.py").exists():
+                names.add(p.name)
+
+    # Walk all __init__.py files under root to find top-level packages
+    _skip = {".venv", "node_modules", "__pycache__"}
+    for init_file in root.rglob("__init__.py"):
+        # Skip ignored directories anywhere in the path
+        if any(part in _skip for part in init_file.parts):
+            continue
+        pkg_dir = init_file.parent
+        # Walk up while the parent also has __init__.py (i.e. is still a pkg)
+        while (pkg_dir.parent / "__init__.py").exists():
+            pkg_dir = pkg_dir.parent
+        # pkg_dir is now the top-level package directory
+        names.add(pkg_dir.name)
+
+    # Also add stems of all .py files directly inside any "src" directory
+    for src_candidate in root.rglob("src"):
+        if not src_candidate.is_dir():
+            continue
+        if any(part in _skip for part in src_candidate.parts):
+            continue
+        for p in src_candidate.iterdir():
+            if p.is_file() and p.suffix == ".py" and p.stem != "__init__":
+                names.add(p.stem)
+
+    return frozenset(names)
+
+
 def _is_local(name: str, root: Path) -> bool:
     """Return True if `name` appears to be a local module under root."""
-    return (
+    # Fast direct checks
+    if (
         (root / f"{name}.py").exists()
         or (root / name / "__init__.py").exists()
-        or (root / name).is_dir()
-    )
+        or (root / "src" / f"{name}.py").exists()
+        or (root / "src" / name / "__init__.py").exists()
+    ):
+        return True
+    # Full package scan (cached)
+    return name in _compute_local_packages(root)
 
 
 def analyze(root: Path, ignore: set) -> list[CodeSmell]:

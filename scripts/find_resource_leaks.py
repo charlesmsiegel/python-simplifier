@@ -96,31 +96,20 @@ def _enclosing_scope_stmts(tree, assign_node):
 def _scope_has_close_call(scope_stmts, var_name: str) -> bool:
     """
     Return True if the scope body (list of stmts) contains a call
-    `var_name.close()` without descending into nested function defs.
-    """
-    def _walk_stmts(stmts):
-        for stmt in stmts:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue  # don't descend into nested scopes
-            # Check this statement for a close() call
-            for node in ast.walk(stmt):
-                # Don't descend into nested function/class within walk results
-                # (ast.walk does descend, but we'll check after)
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "close"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == var_name
-                ):
-                    return True
-        return False
+    `var_name.close()` that executes unconditionally (i.e. not inside an
+    if/while/for/asyncfor/except handler), EXCEPT that a close() inside a
+    try's finalbody is always considered unconditional.
 
-    # We need a version that doesn't descend into nested functions.
-    # ast.walk descends everywhere, so use a manual traversal instead.
-    def _check_node(node):
+    Does not descend into nested function/async-function definitions.
+    """
+    # Walk carrying a `conditional` flag.  A close() suppresses only when
+    # conditional is False at the point of the call.
+    def _walk(node, conditional: bool) -> bool:
+        """Return True if an unconditional close() of var_name is found."""
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return False  # don't descend
+            return False  # don't descend into nested scopes
+
+        # A plain close() call at this level
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -128,14 +117,49 @@ def _scope_has_close_call(scope_stmts, var_name: str) -> bool:
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == var_name
         ):
-            return True
+            return not conditional
+
+        # Nodes that make their children conditional
+        if isinstance(node, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+            # All children of these nodes are conditional
+            for child in ast.iter_child_nodes(node):
+                if _walk(child, True):
+                    return True
+            return False
+
+        if isinstance(node, ast.ExceptHandler):
+            for child in ast.iter_child_nodes(node):
+                if _walk(child, True):
+                    return True
+            return False
+
+        if isinstance(node, ast.Try):
+            # body and handlers are conditional (an exception may or may not occur)
+            for child in node.body:
+                if _walk(child, True):
+                    return True
+            for handler in node.handlers:
+                if _walk(handler, True):
+                    return True
+            # orelse is also conditional
+            for child in node.orelse:
+                if _walk(child, True):
+                    return True
+            # finalbody inherits the OUTER conditionality — a finally at
+            # unconditional scope always runs
+            for child in node.finalbody:
+                if _walk(child, conditional):
+                    return True
+            return False
+
+        # For all other nodes, recurse with the same conditionality
         for child in ast.iter_child_nodes(node):
-            if _check_node(child):
+            if _walk(child, conditional):
                 return True
         return False
 
     for stmt in scope_stmts:
-        if _check_node(stmt):
+        if _walk(stmt, False):
             return True
     return False
 

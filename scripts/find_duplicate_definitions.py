@@ -79,7 +79,10 @@ def _check_body_for_duplicates(body, filename, lines, ignore):
     # def and class bind the same namespace, so duplicates are tracked by NAME
     # alone — a class shadowing a function (or vice versa) is the same bug.
     seen = {}    # name -> (kind, lineno)
-    exempt = set()  # names that legitimately repeat (overload / property groups)
+    # Per-name state: "overload" | "property" | "normal"
+    # Tracks what kind of definitions have been seen so far for each name.
+    state = {}   # name -> str
+
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             kind = "function"
@@ -88,17 +91,59 @@ def _check_body_for_duplicates(body, filename, lines, ignore):
         else:
             continue
         name = node.name
+        st = "duplicate_definition"
 
-        # Overload sets and property/setter/deleter groups repeat a name on
-        # purpose; once a name participates in one, never flag that name here.
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _is_overload(node) or _is_property_group(node):
-                exempt.add(name)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_overload(node):
+            # @overload — never flag, just mark state
+            state[name] = "overload"
+            seen[name] = (kind, node.lineno)
+            continue
 
-        if name in seen and name not in exempt:
-            prev_kind, prev_line = seen[name]
-            st = "duplicate_definition"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_property_group(node):
+            # @property / @x.setter / @x.getter / @x.deleter — never flag,
+            # mark state as "property"
+            state[name] = "property"
+            seen[name] = (kind, node.lineno)
+            continue
+
+        # Plain def/class
+        current_state = state.get(name)
+
+        if current_state == "overload":
+            # This is the overload implementation — allowed, no finding.
+            # Transition to "normal" so a SECOND plain def will be flagged.
+            state[name] = "normal"
+            seen[name] = (kind, node.lineno)
+            continue
+
+        if current_state == "property":
+            # A plain def/class after a complete property group replaces the
+            # entire property descriptor — flag as duplicate.
             if st not in ignore:
+                prev_kind, prev_line = seen[name]
+                what = (
+                    f"{kind.capitalize()} '{name}'"
+                    if prev_kind == kind
+                    else f"{kind.capitalize()} '{name}' (previously a {prev_kind})"
+                )
+                desc = (
+                    f"{what} is defined again at line {node.lineno}; the earlier "
+                    f"property descriptor at line {prev_line} is silently replaced"
+                )
+                sug = "Remove the duplicate (older) definition, keeping only the intended version."
+                issues.append(CodeSmell(
+                    filename, node.lineno, st, desc, sug, "high",
+                    _get_line(lines, node.lineno),
+                ))
+            state[name] = "normal"
+            seen[name] = (kind, node.lineno)
+            continue
+
+        # "normal" or not yet seen
+        if name in seen:
+            # Already have a prior plain definition — flag duplicate
+            if st not in ignore:
+                prev_kind, prev_line = seen[name]
                 what = (
                     f"{kind.capitalize()} '{name}'"
                     if prev_kind == kind
@@ -113,6 +158,8 @@ def _check_body_for_duplicates(body, filename, lines, ignore):
                     filename, node.lineno, st, desc, sug, "high",
                     _get_line(lines, node.lineno),
                 ))
+
+        state[name] = "normal"
         seen[name] = (kind, node.lineno)
 
     return issues

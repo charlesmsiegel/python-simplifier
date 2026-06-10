@@ -25,7 +25,6 @@ import ast
 import sys
 import json
 import argparse
-import contextlib
 import subprocess
 from pathlib import Path
 from collections import defaultdict
@@ -143,19 +142,29 @@ def _expand_to_definitions(filepath, lines):
 
 
 def run_detector(script, filepath):
+    """Run one detector. Returns (findings, error): error is a short string when
+    the detector crashed/timed out/emitted bad JSON — a silent [] would let the
+    diff review claim clean for a category that was never actually evaluated."""
     script_path = Path(__file__).parent / script
     if not script_path.exists():
-        return []
-    # A detector that crashes or emits bad JSON contributes nothing — by design.
-    with contextlib.suppress(subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return [], f"script not found: {script}"
+    try:
         r = subprocess.run(
             [sys.executable, str(script_path), filepath, "--format", "json"],
             capture_output=True, text=True, timeout=120,
         )
-        if r.returncode == 0 and r.stdout.strip():
-            data = json.loads(r.stdout)
-            return data if isinstance(data, list) else data.get("issues", [])
-    return []
+    except (subprocess.SubprocessError, OSError) as e:
+        return [], str(e)[:200] or "failed to run"
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        return [], tail[-1][:200] if tail else f"exit code {r.returncode}"
+    if not r.stdout.strip():
+        return [], "no output"
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        return [], f"bad JSON output: {e}"
+    return (data if isinstance(data, list) else data.get("issues", [])), None
 
 
 def collect(base, all_lines):
@@ -166,7 +175,18 @@ def collect(base, all_lines):
     for filepath, lines in files.items():
         accepted = None if lines is None else _expand_to_definitions(filepath, lines)
         for script in DIFF_SAFE_SCRIPTS:
-            for issue in run_detector(script, filepath):
+            issues, error = run_detector(script, filepath)
+            if error is not None:
+                # Detector failures bypass the changed-line filter: the reader
+                # must see that this category was not evaluated for this file.
+                findings.append({
+                    "file": filepath, "line": 1, "smell_type": "detector_error",
+                    "description": f"{script} did not complete ({error}) — its findings for this file are missing",
+                    "suggestion": f"Run `python scripts/{script} {filepath}` directly to see the failure.",
+                    "severity": "medium",
+                })
+                continue
+            for issue in issues:
                 if not isinstance(issue, dict):
                     continue
                 ln = issue.get("line")

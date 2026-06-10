@@ -226,13 +226,16 @@ def detect(tree, filename, lines, ignore):
                         "high")
 
             # ---------------------------------------------------------------- #
-            # unsafe_yaml — yaml.load() with no Loader= keyword
+            # unsafe_yaml — yaml.load() with no explicit loader
+            # Safe when: Loader= keyword is present OR a second positional arg
+            # is supplied (the caller has deliberately chosen a loader).
             # ---------------------------------------------------------------- #
             elif (isinstance(func, ast.Attribute)
                   and func.attr == "load"
                   and isinstance(func.value, ast.Name)
                   and func.value.id == "yaml"
-                  and not _has_keyword(node, "Loader")):
+                  and not _has_keyword(node, "Loader")
+                  and len(node.args) < 2):
                 add(node.lineno, "unsafe_yaml",
                     "yaml.load() called without a Loader= keyword can execute arbitrary code",
                     "Use yaml.safe_load() instead, or pass Loader=yaml.SafeLoader explicitly.",
@@ -259,30 +262,47 @@ def detect(tree, filename, lines, ignore):
 
             # ---------------------------------------------------------------- #
             # weak_hash — hashlib.md5() or hashlib.sha1()
+            # Skip when usedforsecurity=False is passed explicitly (Constant False).
             # ---------------------------------------------------------------- #
             elif (isinstance(func, ast.Attribute)
                   and func.attr in ("md5", "sha1")
                   and isinstance(func.value, ast.Name)
                   and func.value.id == "hashlib"):
-                add(node.lineno, "weak_hash",
-                    f"hashlib.{func.attr}() is a cryptographically weak hash algorithm",
-                    "Use hashlib.sha256() or stronger for security-sensitive uses. "
-                    "If only used for checksums, add usedforsecurity=False (Python 3.9+) "
-                    "to suppress this warning.",
-                    "medium")
+                ufs = _keyword_value(node, "usedforsecurity")
+                if ufs is None or not _is_false_literal(ufs):
+                    add(node.lineno, "weak_hash",
+                        f"hashlib.{func.attr}() is a cryptographically weak hash algorithm",
+                        "Use hashlib.sha256() or stronger for security-sensitive uses. "
+                        "If only used for checksums, add usedforsecurity=False (Python 3.9+) "
+                        "to suppress this warning.",
+                        "medium")
 
             # ---------------------------------------------------------------- #
             # tls_verify_disabled — call with verify=False or ssl._create_unverified_context
+            # Only flag verify=False when the callee is a known HTTP API method.
             # ---------------------------------------------------------------- #
             else:
                 verify_val = _keyword_value(node, "verify")
                 if verify_val is not None and _is_false_literal(verify_val):
-                    add(node.lineno, "tls_verify_disabled",
-                        "TLS certificate verification disabled via verify=False",
-                        "Keep certificate verification enabled. If testing against a local "
-                        "server use a proper CA bundle or a self-signed cert trusted by the "
-                        "test environment.",
-                        "medium")
+                    _HTTP_ATTR_NAMES = {
+                        "get", "post", "put", "delete", "patch",
+                        "head", "options", "request", "send",
+                    }
+                    _HTTP_NAME_NAMES = {
+                        "get", "post", "put", "delete", "patch",
+                        "head", "options", "request",
+                    }
+                    _is_http_call = (
+                        (isinstance(func, ast.Attribute) and func.attr in _HTTP_ATTR_NAMES)
+                        or (isinstance(func, ast.Name) and func.id in _HTTP_NAME_NAMES)
+                    )
+                    if _is_http_call:
+                        add(node.lineno, "tls_verify_disabled",
+                            "TLS certificate verification disabled via verify=False",
+                            "Keep certificate verification enabled. If testing against a local "
+                            "server use a proper CA bundle or a self-signed cert trusted by the "
+                            "test environment.",
+                            "medium")
                 elif (isinstance(func, ast.Attribute)
                       and func.attr == "_create_unverified_context"
                       and isinstance(func.value, ast.Name)
