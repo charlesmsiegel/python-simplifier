@@ -1036,3 +1036,105 @@ def test_nested_class_base_not_resolved_against_module_scope(tmp_path):
     assert "refused_bequest" not in smell_types(
         run_detector("find_design_smells.py", tmp_path)
     )
+
+
+def test_factory_returning_recorded_attr_is_not_a_singleton(tmp_path):
+    # Assign-then-return still constructs a fresh object per call; only a guard
+    # that reads the stored attribute before constructing is singleton reuse.
+    (tmp_path / "sample.py").write_text(
+        "class Widget:\n"
+        "    @classmethod\n"
+        "    def create_instance(cls, name):\n"
+        "        cls._last_instance = cls(name)\n"
+        "        return cls._last_instance\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_accessors_over_different_attrs_are_not_a_pair(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Reading:\n"
+        "    def get_value(self):\n"
+        "        return self.normalized_value\n"
+        "    def set_value(self, value):\n"
+        "        self.raw_value = value\n"
+    )
+    assert "getter_setter_pair" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_cursor_with_other_methods_is_not_an_iterator_class(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Cursor:\n"
+        "    def __iter__(self):\n"
+        "        return self\n"
+        "    def __next__(self):\n"
+        "        return self.fetchone()\n"
+        "    def execute(self, sql):\n"
+        "        self.sql = sql\n"
+    )
+    assert "iterator_class" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_accumulator_dict_is_not_memoization(tmp_path):
+    # Gate + read + write of a session store is stateful accumulation;
+    # lru_cache would suppress the updates.
+    (tmp_path / "sample.py").write_text(
+        "SESSIONS = {}\n"
+        "\n"
+        "def update_session(key, value):\n"
+        "    if key not in SESSIONS:\n"
+        "        SESSIONS[key] = []\n"
+        "    SESSIONS[key].append(value)\n"
+        "    return SESSIONS[key]\n"
+    )
+    assert "handrolled_memoize" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_exitstack_advice_names_the_actual_receiver(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def send(conn, payload):\n"
+        "    try:\n"
+        "        conn.send(payload)\n"
+        "    finally:\n"
+        "        conn.disconnect()\n"
+    )
+    findings = [f for f in run_detector("find_pattern_issues.py", tmp_path)
+                if f["smell_type"] == "try_finally_close"]
+    assert findings and "conn.disconnect" in findings[0]["suggestion"]
+
+
+def test_analyze_diff_keeps_cross_definition_finding_on_unchanged_anchor(tmp_path):
+    # Adding set_name beside an existing get_name completes the accessor pair;
+    # the finding anchors at the *unchanged* getter and must survive the filter.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "m.py").write_text(
+        "class Person:\n"
+        "    def get_name(self):\n"
+        "        return self._name\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    (repo / "m.py").write_text(
+        "class Person:\n"
+        "    def get_name(self):\n"
+        "        return self._name\n"
+        "\n"
+        "    def set_name(self, value):\n"
+        "        self._name = value\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=repo, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "getter_setter_pair" in {f["smell_type"] for f in json.loads(result.stdout)}

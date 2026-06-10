@@ -203,15 +203,14 @@ class PatternIssueDetector(ast.NodeVisitor):
             }
             if not cached_attrs:
                 continue
-            # An assignment alone could be a factory recording its latest product;
-            # the singleton signature is *reusing* the stored object — a guard
-            # testing it or a return reading it back.
+            # An assignment alone could be a factory recording its latest
+            # product — and a post-assignment `return cls._x` still hands out a
+            # fresh object per call. The singleton signature is a *guard* that
+            # reads the stored attribute before deciding to construct.
             reuses = any(
-                (isinstance(inner, ast.If) and any(
+                isinstance(inner, ast.If) and any(
                     _is_cls_attr(n) and n.attr in cached_attrs
-                    for n in ast.walk(inner.test)))
-                or (isinstance(inner, ast.Return) and inner.value is not None
-                    and _is_cls_attr(inner.value) and inner.value.attr in cached_attrs)
+                    for n in ast.walk(inner.test))
                 for inner in ast.walk(method)
             )
             if reuses:
@@ -310,8 +309,12 @@ class PatternIssueDetector(ast.NodeVisitor):
     # --- Java-style accessors ------------------------------------------- #
 
     def _check_getter_setter_pairs(self, node: ast.ClassDef):
-        getters: dict[str, ast.FunctionDef] = {}
-        setters: dict[str, ast.FunctionDef] = {}
+        # name suffix -> (method, backing attribute). The pair only collapses to
+        # a plain attribute when both sides touch the *same* attribute — a
+        # getter reading self.normalized while the setter writes self.raw is
+        # doing real work.
+        getters: dict[str, tuple[ast.FunctionDef, str]] = {}
+        setters: dict[str, tuple[ast.FunctionDef, str]] = {}
         properties = {m.name for m in _methods(node)
                       if _decorator_names(m) & {"property", "cached_property", "setter"}}
         for method in _methods(node):
@@ -321,17 +324,17 @@ class PatternIssueDetector(ast.NodeVisitor):
             args = method.args.posonlyargs + method.args.args
             if method.name.startswith("get_") and len(args) == 1 and len(body) == 1 \
                     and isinstance(body[0], ast.Return) and _is_self_attr(body[0].value):
-                getters[method.name[4:]] = method
+                getters[method.name[4:]] = (method, body[0].value.attr)
             if method.name.startswith("set_") and len(args) == 2 and len(body) == 1 \
                     and isinstance(body[0], ast.Assign) and len(body[0].targets) == 1 \
                     and _is_self_attr(body[0].targets[0]) \
                     and isinstance(body[0].value, ast.Name) \
                     and body[0].value.id == args[1].arg:
-                setters[method.name[4:]] = method
+                setters[method.name[4:]] = (method, body[0].targets[0].attr)
         for name in sorted(getters.keys() & setters.keys()):
-            if name in properties:
+            if name in properties or getters[name][1] != setters[name][1]:
                 continue
-            self._add(getters[name].lineno, "getter_setter_pair",
+            self._add(getters[name][0].lineno, "getter_setter_pair",
                 f"'{node.name}' has Java-style accessors get_{name}/set_{name} around a plain attribute",
                 "Expose the attribute directly — Python is not Java; @property exists for the "
                 "day logic is needed, with no caller changes", "medium")
@@ -382,6 +385,11 @@ class PatternIssueDetector(ast.NodeVisitor):
     def _check_iterator_class(self, node: ast.ClassDef):
         methods = {m.name: m for m in _methods(node)}
         if "__next__" not in methods or "__iter__" not in methods:
+            return
+        # Only iterator-*only* classes collapse to a generator. A cursor or
+        # protocol object that also exposes execute()/commit()/close() has a
+        # life beyond iteration; rewriting it would not preserve behavior.
+        if set(methods) - {"__init__", "__iter__", "__next__"}:
             return
         iter_body = _strip_docstring(methods["__iter__"].body)
         if len(iter_body) == 1 and isinstance(iter_body[0], ast.Return) \
@@ -549,20 +557,32 @@ def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for cache in detector.module_dicts:
-                gates = reads = writes = False
+
+                def is_cache_sub(n, cache=cache):
+                    return (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                            and n.value.id == cache)
+
+                # Memoization = gate on membership, store a computed result, and
+                # hand the stored entry back. A dict that merely accumulates
+                # state (SESSIONS[k].append(...)) is a store, not a cache —
+                # mutating a cached entry disqualifies.
+                gates = writes = returns_cached = mutates_entry = False
                 for inner in _walk_same_scope(node.body):
                     if isinstance(inner, ast.Compare) and len(inner.ops) == 1 \
                             and isinstance(inner.ops[0], (ast.In, ast.NotIn)) \
                             and isinstance(inner.comparators[0], ast.Name) \
                             and inner.comparators[0].id == cache:
                         gates = True
-                    if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Name) \
-                            and inner.value.id == cache:
-                        if isinstance(inner.ctx, ast.Load):
-                            reads = True
-                        elif isinstance(inner.ctx, ast.Store):
-                            writes = True
-                if gates and reads and writes:
+                    if isinstance(inner, ast.Assign) \
+                            and any(is_cache_sub(t) for t in inner.targets):
+                        writes = True
+                    if isinstance(inner, ast.Return) and is_cache_sub(inner.value):
+                        returns_cached = True
+                    if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+                            and is_cache_sub(inner.func.value)) \
+                            or (isinstance(inner, ast.AugAssign) and is_cache_sub(inner.target)):
+                        mutates_entry = True
+                if gates and writes and returns_cached and not mutates_entry:
                     add(node.lineno, "handrolled_memoize",
                         f"'{node.name}' hand-rolls memoization through module-level dict '{cache}'",
                         "Use @functools.lru_cache (or @functools.cache) if the function is pure "
@@ -582,12 +602,13 @@ def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
                     and not (isinstance(stmt.value.func.value, ast.Name)
                              and stmt.value.func.value.id in ("self", "cls")):
                 cleanup = stmt.value.func.attr
+                receiver = ast.unparse(stmt.value.func.value)[:40]
                 # contextlib.closing() only ever calls .close() — suggesting it
                 # for .release()/.shutdown() would run the wrong (or no) cleanup.
                 fallback = (
                     "wrap it in contextlib.closing()" if cleanup == "close"
                     else f"register the call with contextlib.ExitStack "
-                         f"(stack.callback(obj.{cleanup})) or write a small context manager"
+                         f"(stack.callback({receiver}.{cleanup})) or write a small context manager"
                 )
                 add(node.lineno, "try_finally_close",
                     f"try/finally exists only to call .{cleanup}()",

@@ -59,6 +59,17 @@ DIFF_SAFE_SCRIPTS = [
     "find_local_imports.py",
 ]
 
+# Findings assembled from *several* definitions, anchored at one that may be
+# untouched: adding set_x beside an existing get_x anchors at get_x; adding a
+# second strategy subclass anchors at the unchanged base class. Filtering these
+# by changed line would hide exactly the finding the change introduced, so they
+# are kept whenever their file changed at all.
+CROSS_DEFINITION_SMELLS = {
+    "getter_setter_pair",
+    "stateless_strategy_classes",
+    "string_state_machine",
+}
+
 _ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -202,7 +213,9 @@ def collect(base, all_lines):
                 if not isinstance(issue, dict):
                     continue
                 ln = issue.get("line")
-                if all_lines or accepted is None or (isinstance(ln, int) and ln in accepted):
+                stype = issue.get("smell_type") or issue.get("issue_type")
+                if all_lines or accepted is None or stype in CROSS_DEFINITION_SMELLS \
+                        or (isinstance(ln, int) and ln in accepted):
                     issue.setdefault("severity", "medium")
                     findings.append(issue)
     # De-dupe identical findings (a line can be flagged by overlapping detectors).
