@@ -1431,3 +1431,115 @@ def test_flag_set_in_nested_loop_is_not_a_control_flag(tmp_path):
     assert "control_flag" not in smell_types(
         run_detector("find_design_smells.py", tmp_path)
     )
+
+
+def test_nested_helper_singleton_machinery_not_attributed_to_outer(tmp_path):
+    # The guard and cache assignment live in a nested helper; the outer
+    # accessor constructs fresh on every call.
+    (tmp_path / "sample.py").write_text(
+        "class Service:\n"
+        "    @classmethod\n"
+        "    def make_instance(cls):\n"
+        "        def helper():\n"
+        "            if cls._instance is None:\n"
+        "                cls._instance = cls()\n"
+        "            return cls._instance\n"
+        "        return cls()\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_fluent_setters_are_not_a_builder(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Session:\n"
+        "    async def set_host(self, h):\n"
+        "        self.host = h\n"
+        "        return self\n"
+        "    async def set_port(self, p):\n"
+        "        self.port = p\n"
+        "        return self\n"
+        "    async def set_user(self, u):\n"
+        "        self.user = u\n"
+        "        return self\n"
+        "    def build(self):\n"
+        "        return (self.host, self.port, self.user)\n"
+    )
+    assert "fluent_builder" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_classmethod_strategies_are_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Codec:\n"
+        "    def decode(self, raw):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class JsonCodec(Codec):\n"
+        "    @classmethod\n"
+        "    def decode(cls, raw):\n"
+        "        return cls.loads(raw)\n"
+        "\n"
+        "class XmlCodec(Codec):\n"
+        "    @classmethod\n"
+        "    def decode(cls, raw):\n"
+        "        return cls.parse(raw)\n"
+    )
+    assert "stateless_strategy_classes" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_lazy_property_with_setter_not_pushed_to_cached_property(tmp_path):
+    # cached_property has no setter API; client.conn = x would stop working.
+    (tmp_path / "sample.py").write_text(
+        "class Client:\n"
+        "    @property\n"
+        "    def conn(self):\n"
+        "        if self._conn is None:\n"
+        "            self._conn = connect()\n"
+        "        return self._conn\n"
+        "\n"
+        "    @conn.setter\n"
+        "    def conn(self, value):\n"
+        "        self._conn = value\n"
+    )
+    assert "handrolled_lazy_property" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_uncalled_nested_helper_does_not_make_del_cleanup(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import warnings\n"
+        "\n"
+        "class Conn:\n"
+        "    def __del__(self):\n"
+        "        def cleanup():\n"
+        "            self.handle.close()\n"
+        "        warnings.warn('unclosed Conn', ResourceWarning)\n"
+    )
+    assert "finalizer_del" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_callback_field_use_is_not_a_temporary_field(tmp_path):
+    # The nested callback runs later; self.current persists between calls and
+    # is not scratch local to make_callback.
+    (tmp_path / "sample.py").write_text(
+        "class Tracker:\n"
+        "    def __init__(self):\n"
+        "        self.current = None\n"
+        "\n"
+        "    def make_callback(self):\n"
+        "        def on_event(value):\n"
+        "            self.current = value\n"
+        "            log(self.current)\n"
+        "        return on_event\n"
+    )
+    assert "temporary_field" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )

@@ -205,7 +205,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                 continue
             cached_attrs = {
                 t.attr
-                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                for inner in _walk_same_scope(method.body) if isinstance(inner, ast.Assign)
                 and _is_super_call_to(inner.value, "__new__")
                 for t in inner.targets if is_class_attr(t)
             }
@@ -216,7 +216,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                 isinstance(inner, ast.If) and any(
                     is_class_attr(n) and n.attr in cached_attrs
                     for n in ast.walk(inner.test))
-                for inner in ast.walk(method)
+                for inner in _walk_same_scope(method.body)
             )
             if cached_attrs and reuses:
                 self._add(method.lineno, "handrolled_singleton",
@@ -237,7 +237,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                 continue
             cached_attrs = {
                 t.attr
-                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                for inner in _walk_same_scope(method.body) if isinstance(inner, ast.Assign)
                 and isinstance(inner.value, ast.Call)
                 and isinstance(inner.value.func, ast.Name) and inner.value.func.id == "cls"
                 for t in inner.targets if _is_cls_attr(t)
@@ -252,7 +252,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                 isinstance(inner, ast.If) and any(
                     _is_cls_attr(n) and n.attr in cached_attrs
                     for n in ast.walk(inner.test))
-                for inner in ast.walk(method)
+                for inner in _walk_same_scope(method.body)
             )
             if reuses:
                 self._add(method.lineno, "handrolled_singleton",
@@ -273,7 +273,7 @@ class PatternIssueDetector(ast.NodeVisitor):
             # validation branch beside a recorder assignment is not caching.
             storage = {
                 ast.unparse(t.value if isinstance(t, ast.Subscript) else t)
-                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                for inner in _walk_same_scope(method.body) if isinstance(inner, ast.Assign)
                 and _is_super_call_to(inner.value, "__call__")
                 for t in inner.targets if isinstance(t, (ast.Subscript, ast.Attribute))
             }
@@ -282,7 +282,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                     isinstance(n, (ast.Attribute, ast.Subscript, ast.Name))
                     and ast.unparse(n) in storage
                     for n in ast.walk(inner.test))
-                for inner in ast.walk(method)
+                for inner in _walk_same_scope(method.body)
             )
             if storage and gated:
                 self._add(node.lineno, "handrolled_singleton",
@@ -315,7 +315,7 @@ class PatternIssueDetector(ast.NodeVisitor):
         for method in _methods(node):
             if method.name != "__init__":
                 continue
-            for inner in ast.walk(method):
+            for inner in _walk_same_scope(method.body):
                 if isinstance(inner, ast.Assign) \
                         and any(_is_self_attr(t, "__dict__") for t in inner.targets) \
                         and is_shared(inner.value):
@@ -337,7 +337,7 @@ class PatternIssueDetector(ast.NodeVisitor):
             # building value maps, say) is doing real metaclass work.
             new_cls_names = {
                 t.id
-                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                for inner in _walk_same_scope(method.body) if isinstance(inner, ast.Assign)
                 and _is_super_call_to(inner.value, "__new__")
                 for t in inner.targets if isinstance(t, ast.Name)
             }
@@ -348,7 +348,7 @@ class PatternIssueDetector(ast.NodeVisitor):
             # discarded on return is not a registry.
             local_names = {
                 t.id
-                for inner in ast.walk(method)
+                for inner in _walk_same_scope(method.body)
                 if isinstance(inner, (ast.Assign, ast.AnnAssign))
                 for t in (inner.targets if isinstance(inner, ast.Assign) else [inner.target])
                 if isinstance(t, ast.Name)
@@ -430,10 +430,14 @@ class PatternIssueDetector(ast.NodeVisitor):
     # --- Lazy property → functools.cached_property ----------------------- #
 
     def _check_lazy_properties(self, node: ast.ClassDef):
+        # A property with a sibling @x.setter/@x.deleter exposes an assignment
+        # API that cached_property does not have — swapping would break it.
+        has_accessors = {m.name for m in _methods(node)
+                         if _decorator_names(m) & {"setter", "deleter"}}
         for method in _methods(node):
             # cached_property on an async def would cache the coroutine object,
             # which cannot be awaited twice — sync methods only.
-            if not isinstance(method, ast.FunctionDef):
+            if not isinstance(method, ast.FunctionDef) or method.name in has_accessors:
                 continue
             if "property" not in _decorator_names(method):
                 continue
@@ -501,6 +505,10 @@ class PatternIssueDetector(ast.NodeVisitor):
         for method in _methods(node):
             if method.name in BUILD_FINISHERS:
                 has_finisher = True
+            # async setters are awaited scheduling boundaries — kwargs cannot
+            # replace them without changing every call site.
+            if not isinstance(method, ast.FunctionDef):
+                continue
             # Only a *narrow* setter — store one attribute, return self — is
             # builder boilerplate. A method that also validates, does I/O, or
             # calls collaborators would not survive collapsing into kwargs.
@@ -533,7 +541,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                 does_cleanup = any(
                     isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
                     and inner.func.attr in CLEANUP_METHODS
-                    for inner in ast.walk(method)
+                    for inner in _walk_same_scope(method.body)
                 )
                 if not does_cleanup:
                     continue
@@ -606,9 +614,11 @@ class PatternIssueDetector(ast.NodeVisitor):
                     ok = False
                     break
                 body = _strip_docstring(cls.body)
+                # A decorated method (@classmethod, registration) has calling
+                # semantics or side effects a plain function would lose.
                 if len(body) != 1 \
                         or not isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                        or body[0].name.startswith("_"):
+                        or body[0].name.startswith("_") or body[0].decorator_list:
                     ok = False
                     break
                 method_names.add(body[0].name)

@@ -285,7 +285,10 @@ class DesignSmellDetector(ast.NodeVisitor):
             self._add(node.lineno, "control_flag",
                 f"Loop is steered by boolean flag '{flag}' reassigned in the body",
                 "Use break/return at the point the flag is set, or make the loop "
-                "condition the real condition (Remove Control Flag)", "low")
+                "condition the real condition (Remove Control Flag) — but first move "
+                "any statements that still run after the flag is set: the loop "
+                "currently finishes the iteration before exiting, a break would not",
+                "low")
         self.generic_visit(node)
 
     # ----------------------------------------------------------------- #
@@ -326,7 +329,7 @@ class DesignSmellDetector(ast.NodeVisitor):
             return
         none_fields: dict[str, int] = {}
         disqualified: set[str] = set()
-        for inner in ast.walk(init):
+        for inner in _walk_same_scope(init.body):
             if isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name) \
                     and inner.value.id == "self":
                 if isinstance(inner.ctx, ast.Load):
@@ -356,7 +359,7 @@ class DesignSmellDetector(ast.NodeVisitor):
             decorators = _decorator_names(method)
             if decorators & PROPERTY_DECORATORS or {"setter", "getter", "deleter"} & decorators:
                 accessor_like.add(method.name)
-            for inner in ast.walk(method):
+            for inner in _walk_same_scope(method.body):
                 if isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name) \
                         and inner.value.id == "self" and inner.attr in none_fields:
                     usage[inner.attr].add(method.name)
