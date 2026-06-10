@@ -241,8 +241,10 @@ class DesignSmellDetector(ast.NodeVisitor):
         if len(first_dumps) == 1:
             self._add(node.lineno, "duplicate_conditional_fragment",
                 f"All {len(bodies)} branches start with the same statement",
-                "Move the shared statement before the conditional — but verify the "
-                "condition does not read anything that statement writes", "low")
+                "Move the shared statement before the conditional — but only if the "
+                "condition does not read anything that statement writes AND the condition "
+                "itself is side-effect-free: today the statement runs only after the "
+                "condition has been evaluated without raising", "low")
 
     # ----------------------------------------------------------------- #
     # Remove Control Flag
@@ -250,16 +252,19 @@ class DesignSmellDetector(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While):
         flag = None
+        terminating = None
         if isinstance(node.test, ast.Name):
-            flag = node.test.id
+            flag, terminating = node.test.id, False
         elif (isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)
                 and isinstance(node.test.operand, ast.Name)):
-            flag = node.test.operand.id
+            flag, terminating = node.test.operand.id, True
+        # Only the assignment that would *exit* this loop is a control flag:
+        # `running = True` inside `while running` keeps it going.
         if flag and any(
             isinstance(inner, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == flag for t in inner.targets)
             and isinstance(inner.value, ast.Constant)
-            and isinstance(inner.value.value, bool)
+            and inner.value.value is terminating
             for inner in _walk_same_scope(node.body)
         ):
             self._add(node.lineno, "control_flag",
@@ -326,6 +331,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         if not none_fields:
             return
         usage: dict[str, set[str]] = defaultdict(set)
+        loaded_in: dict[str, set[str]] = defaultdict(set)
         accessor_like: set[str] = set()
         for method in self._methods(node):
             if method.name == "__init__":
@@ -337,12 +343,18 @@ class DesignSmellDetector(ast.NodeVisitor):
                 if isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name) \
                         and inner.value.id == "self" and inner.attr in none_fields:
                     usage[inner.attr].add(method.name)
+                    if isinstance(inner.ctx, ast.Load):
+                        loaded_in[inner.attr].add(method.name)
         for attr, line in none_fields.items():
             if attr in disqualified:
                 continue
             methods = usage.get(attr, set())
             # Lazy-init caches behind a property are idiomatic, not a smell.
-            if len(methods) == 1 and not methods & accessor_like:
+            # A field only *written* by its one method is an output field
+            # (self.result populated for callers), not method-local scratch —
+            # temporary fields are read back within the same operation.
+            if len(methods) == 1 and not methods & accessor_like \
+                    and methods & loaded_in.get(attr, set()):
                 only = next(iter(methods))
                 self._add(line, "temporary_field",
                     f"Field 'self.{attr}' is None except inside '{only}' — a temporary field",

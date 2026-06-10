@@ -30,7 +30,7 @@ import ast
 import json
 import argparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Iterator
 from collections import defaultdict
 
@@ -44,6 +44,10 @@ class PatternIssue:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # Cross-definition findings list every participating definition here, so
+    # diff tooling can keep the finding when *any* participant changed even
+    # though `line` anchors at one (possibly unchanged) definition.
+    related_lines: list[int] = field(default_factory=list)
 
 
 CLEANUP_METHODS = frozenset({"close", "release", "disconnect", "shutdown", "terminate"})
@@ -132,13 +136,15 @@ class PatternIssueDetector(ast.NodeVisitor):
             return self.source_lines[lineno - 1].strip()[:60]
         return ""
 
-    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium"):
+    def _add(self, line: int, smell_type: str, desc: str, suggestion: str,
+             severity: str = "medium", related: list[int] = None):
         if smell_type in self.ignore:
             return
         self.issues.append(PatternIssue(
             file=self.filename, line=line, smell_type=smell_type,
             description=desc, suggestion=suggestion, severity=severity,
-            code_snippet=self._get_line(line)
+            code_snippet=self._get_line(line),
+            related_lines=sorted(related) if related else []
         ))
 
     def check_module(self):
@@ -169,23 +175,39 @@ class PatternIssueDetector(ast.NodeVisitor):
 
     def _check_singleton_new(self, node: ast.ClassDef):
         """__new__ that caches the instance on a class attribute."""
+
+        def is_class_attr(t: ast.AST) -> bool:
+            return _is_cls_attr(t) or (isinstance(t, ast.Attribute)
+                                       and isinstance(t.value, ast.Name)
+                                       and t.value.id == node.name)
+
         for method in _methods(node):
             if method.name != "__new__":
                 continue
-            for inner in ast.walk(method):
-                if isinstance(inner, ast.Assign) \
-                        and any(_is_cls_attr(t) or isinstance(t, ast.Attribute)
-                                and isinstance(t.value, ast.Name) and t.value.id == node.name
-                                for t in inner.targets) \
-                        and _is_super_call_to(inner.value, "__new__"):
-                    self._add(method.lineno, "handrolled_singleton",
-                        f"'{node.name}.__new__' caches the instance on a class attribute "
-                        "— a hand-rolled Singleton",
-                        "A module is already a singleton: create one instance at module level "
-                        "and import it (Global Object pattern). If construction must be lazy, "
-                        "expose a module-level @functools.cache function instead. Hidden single "
-                        "instances are global state — prefer passing the object in", "medium")
-                    return
+            cached_attrs = {
+                t.attr
+                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                and _is_super_call_to(inner.value, "__new__")
+                for t in inner.targets if is_class_attr(t)
+            }
+            # Recording the latest creation (cls.last = super().__new__(cls);
+            # return cls.last) still constructs every call — the singleton
+            # signature is a guard reading the stored attribute first.
+            reuses = any(
+                isinstance(inner, ast.If) and any(
+                    is_class_attr(n) and n.attr in cached_attrs
+                    for n in ast.walk(inner.test))
+                for inner in ast.walk(method)
+            )
+            if cached_attrs and reuses:
+                self._add(method.lineno, "handrolled_singleton",
+                    f"'{node.name}.__new__' caches the instance on a class attribute "
+                    "— a hand-rolled Singleton",
+                    "A module is already a singleton: create one instance at module level "
+                    "and import it (Global Object pattern). If construction must be lazy, "
+                    "expose a module-level @functools.cache function instead. Hidden single "
+                    "instances are global state — prefer passing the object in", "medium")
+                return
 
     def _check_singleton_accessor(self, node: ast.ClassDef):
         """classmethod get_instance()-style cached accessor: cls._x = cls(...)."""
@@ -296,8 +318,26 @@ class PatternIssueDetector(ast.NodeVisitor):
             }
             if method.name == "__init__":
                 new_cls_names.add(method.args.args[0].arg if method.args.args else "cls")
+            # The mapping must outlive the call: an attribute (mcs.REGISTRY) or
+            # a non-local name. A `local = {}` filled during validation and
+            # discarded on return is not a registry.
+            local_names = {
+                t.id
+                for inner in ast.walk(method)
+                if isinstance(inner, (ast.Assign, ast.AnnAssign))
+                for t in (inner.targets if isinstance(inner, ast.Assign) else [inner.target])
+                if isinstance(t, ast.Name)
+            }
+
+            def is_persistent(sub: ast.Subscript) -> bool:
+                base = sub.value
+                if isinstance(base, ast.Attribute):
+                    return True
+                return isinstance(base, ast.Name) and base.id not in local_names
+
             if any(isinstance(inner, ast.Assign)
-                   and any(isinstance(t, ast.Subscript) for t in inner.targets)
+                   and any(isinstance(t, ast.Subscript) and is_persistent(t)
+                           for t in inner.targets)
                    and isinstance(inner.value, ast.Name) and inner.value.id in new_cls_names
                    for inner in ast.walk(method)):
                 self._add(node.lineno, "registry_metaclass",
@@ -337,7 +377,8 @@ class PatternIssueDetector(ast.NodeVisitor):
             self._add(getters[name][0].lineno, "getter_setter_pair",
                 f"'{node.name}' has Java-style accessors get_{name}/set_{name} around a plain attribute",
                 "Expose the attribute directly — Python is not Java; @property exists for the "
-                "day logic is needed, with no caller changes", "medium")
+                "day logic is needed, with no caller changes", "medium",
+                related=[getters[name][0].lineno, setters[name][0].lineno])
 
     # --- Lazy property → functools.cached_property ----------------------- #
 
@@ -409,14 +450,17 @@ class PatternIssueDetector(ast.NodeVisitor):
         for method in _methods(node):
             if method.name in BUILD_FINISHERS:
                 has_finisher = True
+            # Only a *narrow* setter — store one attribute, return self — is
+            # builder boilerplate. A method that also validates, does I/O, or
+            # calls collaborators would not survive collapsing into kwargs.
             body = _strip_docstring(method.body)
-            if not body or not isinstance(body[-1], ast.Return):
+            if len(body) != 2 or not isinstance(body[-1], ast.Return):
                 continue
             ret = body[-1].value
             if not (isinstance(ret, ast.Name) and ret.id == "self"):
                 continue
-            if any(isinstance(s, ast.Assign) and any(_is_self_attr(t) for t in s.targets)
-                   for s in body):
+            if isinstance(body[0], ast.Assign) and len(body[0].targets) == 1 \
+                    and _is_self_attr(body[0].targets[0]):
                 chained.append(method)
         if len(chained) >= 3 and has_finisher:
             self._add(node.lineno, "fluent_builder",
@@ -456,6 +500,7 @@ class PatternIssueDetector(ast.NodeVisitor):
         values: dict[str, set[str]] = defaultdict(set)
         transition_assigns: dict[str, int] = defaultdict(int)
         first_line: dict[str, int] = {}
+        involved: dict[str, set[int]] = defaultdict(set)
         for method in _methods(node):
             for inner in ast.walk(method):
                 if isinstance(inner, ast.Compare) and len(inner.ops) == 1 \
@@ -467,11 +512,13 @@ class PatternIssueDetector(ast.NodeVisitor):
                     compare_methods[attr].add(method.name)
                     values[attr].add(inner.comparators[0].value)
                     first_line.setdefault(attr, inner.lineno)
+                    involved[attr].add(inner.lineno)
                 if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Constant) \
                         and isinstance(inner.value.value, str):
                     for target in inner.targets:
                         if _is_self_attr(target):
                             values[target.attr].add(inner.value.value)
+                            involved[target.attr].add(inner.lineno)
                             if method.name != "__init__":
                                 transition_assigns[target.attr] += 1
         for attr, methods in compare_methods.items():
@@ -482,7 +529,7 @@ class PatternIssueDetector(ast.NodeVisitor):
                     "At minimum make the states an Enum (typo-proof, exhaustiveness-checkable). "
                     "If behavior branches on the state in several methods, dispatch on it — "
                     "a dict keyed by state or the State pattern — so a new state is an entry, "
-                    "not another elif", "medium")
+                    "not another elif", "medium", related=sorted(involved[attr]))
 
     # ----------------------------------------------------------------- #
     # Stateless single-method hierarchies (module-level pass)
@@ -522,7 +569,8 @@ class PatternIssueDetector(ast.NodeVisitor):
                 f"'{method}' — a class hierarchy standing in for functions",
                 "Functions are first-class in Python: replace each class with a plain function "
                 "and select via a dispatch dict (or pass the callable directly). Keep classes "
-                "only when strategies carry configuration or state", "medium")
+                "only when strategies carry configuration or state", "medium",
+                related=[base.lineno] + [c.lineno for c in subclasses])
 
 
 def analyze_file(filepath: Path, ignore: set[str]) -> list[PatternIssue]:

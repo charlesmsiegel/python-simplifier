@@ -1138,3 +1138,112 @@ def test_analyze_diff_keeps_cross_definition_finding_on_unchanged_anchor(tmp_pat
     )
     assert result.returncode == 0, result.stderr[:500]
     assert "getter_setter_pair" in {f["smell_type"] for f in json.loads(result.stdout)}
+
+
+def test_recording_new_is_not_a_singleton(tmp_path):
+    # cls.last_created = super().__new__(cls); return — constructs every call.
+    (tmp_path / "sample.py").write_text(
+        "class Tracker:\n"
+        "    def __new__(cls):\n"
+        "        cls.last_created = super().__new__(cls)\n"
+        "        return cls.last_created\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_local_dict_in_metaclass_is_not_a_registry(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class CheckingMeta(type):\n"
+        "    def __new__(mcs, name, bases, ns):\n"
+        "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+        "        local = {}\n"
+        "        local[name] = new_cls\n"
+        "        validate(local)\n"
+        "        return new_cls\n"
+    )
+    assert "registry_metaclass" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_working_setters_are_not_a_fluent_builder(tmp_path):
+    # Setters that validate / call collaborators are not builder boilerplate.
+    (tmp_path / "sample.py").write_text(
+        "class Pipeline:\n"
+        "    def set_source(self, src):\n"
+        "        self.source = validate_source(src)\n"
+        "        self.refresh()\n"
+        "        return self\n"
+        "    def set_sink(self, sink):\n"
+        "        if sink is None:\n"
+        "            raise ValueError\n"
+        "        self.sink = sink\n"
+        "        return self\n"
+        "    def set_mode(self, mode):\n"
+        "        self.mode = mode\n"
+        "        self.log.info(mode)\n"
+        "        return self\n"
+        "    def build(self):\n"
+        "        return (self.source, self.sink, self.mode)\n"
+    )
+    assert "fluent_builder" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_result_field_only_written_is_not_temporary(tmp_path):
+    # An output field populated for callers is part of the state model.
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.result = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.result = compute()\n"
+    )
+    assert "temporary_field" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_non_terminating_flag_assignment_is_not_a_control_flag(tmp_path):
+    # `running = True` inside `while running` keeps the loop going.
+    (tmp_path / "sample.py").write_text(
+        "def serve(jobs):\n"
+        "    running = False\n"
+        "    while running:\n"
+        "        if jobs:\n"
+        "            running = True\n"
+    )
+    assert "control_flag" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_analyze_diff_drops_cross_definition_finding_on_unrelated_edit(tmp_path):
+    # A pre-existing accessor pair must not surface when the change touches
+    # only an unrelated function in the same file.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    pair = (
+        "class Person:\n"
+        "    def get_name(self):\n"
+        "        return self._name\n"
+        "\n"
+        "    def set_name(self, value):\n"
+        "        self._name = value\n"
+        "\n"
+    )
+    (repo / "m.py").write_text(pair + "\ndef unrelated():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    (repo / "m.py").write_text(pair + "\ndef unrelated():\n    return 2\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=repo, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "getter_setter_pair" not in {f["smell_type"] for f in json.loads(result.stdout)}
