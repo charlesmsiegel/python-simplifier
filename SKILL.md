@@ -86,6 +86,7 @@ python scripts/find_coupling_issues.py .       # Feature envy, low cohesion (LCO
 python scripts/find_code_smells.py .           # Mutable defaults, bare excepts, magic numbers, god classes
 python scripts/find_dead_code.py .             # Unused imports/functions/params, unreachable code
 python scripts/find_overengineering.py .       # Single-impl interfaces, factories, thin wrappers (YAGNI)
+python scripts/find_design_smells.py .         # Classic-catalog smells: type-switches, refused bequest, temporary fields, intimacy
 python scripts/find_unpythonic.py .            # range(len), == True/None, manual index tracking
 
 # Correctness bugs (these find real bugs, not style)
@@ -177,7 +178,8 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 |---|---|
 | Starting any review — the master stance, workflow, critical-questions checklist, triage | `references/critical-review-guide.md` |
 | Deciding whether an abstraction should exist; DRY vs the wrong abstraction; YAGNI | `references/overengineering-and-abstraction.md` |
-| You see design smells by reading (feature envy, divergent change, shotgun surgery, primitive obsession, temporal coupling, god class, message chains) | `references/refactoring-catalog.md` |
+| Diagnosing design smells — the full classic catalog (bloaters, OO abusers, change preventers, dispensables, couplers) and triaging detector candidates | `references/refactoring-catalog.md` |
+| Executing a fix — the named refactoring techniques, safe step-by-step mechanics, Python equivalents of the classic moves | `references/refactoring-techniques.md` |
 | Judging names, comments, and function shape; deleting comments that lie | `references/naming-comments-readability.md` |
 | Choosing the right Python pattern AND making the codebase use it consistently | `references/patterns-and-consistency.md` |
 | You want concrete before/after idiom swaps | `references/python-idioms.md` |
@@ -207,6 +209,11 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | Bare/broad except, swallowed error, `raise` without `from` | Catch narrow, chain with `from`, never `pass` |
 | God class / long function / deep nesting | Extract class/method; guard clauses |
 | Feature envy / message chains | Move method; hide delegate |
+| Reaching into `other._private` internals | Move method, or expose an intentional API |
+| Field that is `None` except in one method | Pass parameters or extract the method object |
+| Subclass that no-ops/raises on inherited methods | Composition (refused bequest) |
+| Same statement in every if/elif branch | Hoist it out of the conditional |
+| Bool flag steering a while loop | `break`/`return` at the decision point |
 | Data clump (params travelling together) | Bundle into a dataclass |
 | Boolean flag parameter | Split the function or use an enum |
 | if/elif type-switch | Dispatch dict or polymorphism |

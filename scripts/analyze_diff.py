@@ -34,6 +34,7 @@ from collections import defaultdict
 DIFF_SAFE_SCRIPTS = [
     "analyze_complexity.py",
     "find_code_smells.py",
+    "find_design_smells.py",
     "find_unpythonic.py",
     "find_mutation_hazards.py",
     "find_exception_issues.py",

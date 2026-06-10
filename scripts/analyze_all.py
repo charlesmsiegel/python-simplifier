@@ -44,6 +44,9 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
     oe_result = run_analyzer('find_overengineering.py', path)
     results['overengineering'] = oe_result.get('issues', []) if isinstance(oe_result, dict) else oe_result
 
+    print("🔍 Finding classic design smells...", file=sys.stderr)
+    results['design_smells'] = run_analyzer('find_design_smells.py', path)
+
     print("🔍 Finding dead code...", file=sys.stderr)
     results['dead_code'] = run_analyzer('find_dead_code.py', path)
 
@@ -258,6 +261,8 @@ def print_text_report(report: dict):
         recommendations.append("• Address code smells - fix mutable defaults, bare excepts")
     if summary['by_category'].get('overengineering', 0) > 0:
         recommendations.append("• Simplify architecture - remove unused abstractions (YAGNI)")
+    if summary['by_category'].get('design_smells', 0) > 0:
+        recommendations.append("• Apply the classic refactorings - dispatch over type-switches, untangle intimate classes (see references/refactoring-techniques.md)")
     if summary['by_category'].get('dead_code', 0) > 5:
         recommendations.append("• Clean up dead code - remove unused imports and functions")
     if summary['by_category'].get('duplicates', 0) > 0:
@@ -328,6 +333,7 @@ Runs all analysis checks:
   - Complexity (cyclomatic, cognitive, nesting)
   - Code smells (mutable defaults, bare excepts, etc.)
   - Over-engineering (unused abstractions, YAGNI)
+  - Design smells from the classic catalog (type-switches, refused bequest, intimacy)
   - Dead code (unused imports, functions)
   - Unpythonic patterns (range(len), == True)
   - Coupling/cohesion (feature envy, message chains)

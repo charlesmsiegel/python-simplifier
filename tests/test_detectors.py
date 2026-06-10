@@ -186,6 +186,64 @@ CASES = [
         },
         {"missing_dependency", "unpinned_dependency"},
     ),
+    (
+        "find_design_smells.py",
+        {
+            "sample.py": (
+                "def dispatch(kind, other):\n"
+                "    print(other._secret)\n"
+                "    if kind == 'a':\n"
+                "        out = 1\n"
+                "        log()\n"
+                "    elif kind == 'b':\n"
+                "        out = 2\n"
+                "        log()\n"
+                "    elif kind == 'c':\n"
+                "        out = 3\n"
+                "        log()\n"
+                "    elif kind == 'd':\n"
+                "        out = 4\n"
+                "        log()\n"
+                "    else:\n"
+                "        out = 5\n"
+                "        log()\n"
+                "    return out\n"
+                "\n"
+                "def wait(jobs):\n"
+                "    done = False\n"
+                "    while not done:\n"
+                "        if not jobs:\n"
+                "            done = True\n"
+            )
+        },
+        {"type_switch", "duplicate_conditional_fragment", "control_flag", "inappropriate_intimacy"},
+    ),
+    (
+        "find_design_smells.py",
+        {
+            "sample.py": (
+                "class Base:\n"
+                "    def render(self):\n"
+                "        return 'base'\n"
+                "\n"
+                "class Child(Base):\n"
+                "    def __init__(self):\n"
+                "        self.scratch = None\n"
+                "        self.kept = 1\n"
+                "\n"
+                "    def render(self):\n"
+                "        raise NotImplementedError\n"
+                "\n"
+                "    def only_user(self):\n"
+                "        self.scratch = object()\n"
+                "        return self.scratch\n"
+                "\n"
+                "class Echo(Child):\n"
+                "    pass\n"
+            )
+        },
+        {"refused_bequest", "temporary_field", "lazy_class"},
+    ),
 ]
 
 
@@ -225,6 +283,7 @@ QUIET_ON_CLEAN = [
     "find_missing_docstrings.py",
     "find_type_gaps.py",
     "find_test_smells.py",
+    "find_design_smells.py",
 ]
 
 
@@ -517,6 +576,74 @@ def test_docstring_with_example_url_is_not_a_placeholder(tmp_path):
         "    return 1\n"
     )
     assert "placeholder_value" not in smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+
+
+def test_design_smells_skip_idiomatic_patterns(tmp_path):
+    """Lazy-init property, dunder privates, namedtuple API, imported modules,
+    exception subclasses and short ladders are idioms, not smells."""
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "from collections import namedtuple\n"
+        "\n"
+        "Point = namedtuple('Point', 'x y')\n"
+        "\n"
+        "class Config:\n"
+        "    def __init__(self):\n"
+        "        self._cache = None\n"
+        "\n"
+        "    @property\n"
+        "    def cache(self):\n"
+        "        if self._cache is None:\n"
+        "            self._cache = os.environ.get('X')\n"
+        "        return self._cache\n"
+        "\n"
+        "    def __eq__(self, other):\n"
+        "        return self._cache == other._cache\n"
+        "\n"
+        "class MyError(ValueError):\n"
+        "    pass\n"
+        "\n"
+        "def move(p):\n"
+        "    os._exit\n"
+        "    return p._replace(x=p.x + 1)\n"
+        "\n"
+        "def two_way(kind):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    return 3\n"
+    )
+    assert smell_types(run_detector("find_design_smells.py", tmp_path)) == set()
+
+
+def test_ladder_on_mixed_subjects_is_not_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(kind, size, mode, flag):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif size == 2:\n"
+        "        return 2\n"
+        "    elif mode == 'x':\n"
+        "        return 3\n"
+        "    elif flag == 'y':\n"
+        "        return 4\n"
+        "    else:\n"
+        "        return 5\n"
+    )
+    assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_abstract_stub_with_imported_base_is_not_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class Renderer(ABC):\n"
+        "    @abstractmethod\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
 
 
 def test_analyze_diff_surfaces_detector_failures(tmp_path):
