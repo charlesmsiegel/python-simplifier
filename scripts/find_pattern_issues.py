@@ -54,6 +54,17 @@ BUILD_FINISHERS = frozenset({"build", "get_result", "result", "create", "finish"
 ABSTRACT_MARKER_BASES = frozenset({"ABC", "Protocol"})
 
 
+def _walk_same_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
+    """Walk statements without descending into nested scopes (defs, classes,
+    lambdas) — cache handling there belongs to that scope's own finding."""
+    stack: list[ast.AST] = list(stmts)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
@@ -183,26 +194,49 @@ class PatternIssueDetector(ast.NodeVisitor):
                 continue
             if "classmethod" not in _decorator_names(method):
                 continue
-            for inner in ast.walk(method):
-                if isinstance(inner, ast.Assign) and any(_is_cls_attr(t) for t in inner.targets) \
-                        and isinstance(inner.value, ast.Call) \
-                        and isinstance(inner.value.func, ast.Name) and inner.value.func.id == "cls":
-                    self._add(method.lineno, "handrolled_singleton",
-                        f"'{node.name}.{method.name}' is a get-instance accessor caching a "
-                        "single instance — a hand-rolled Singleton",
-                        "Create the instance once at module level and import it (Global Object "
-                        "pattern), or use a module-level @functools.cache factory function. "
-                        "Callers should receive the object, not fetch it", "medium")
-                    return
+            cached_attrs = {
+                t.attr
+                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                and isinstance(inner.value, ast.Call)
+                and isinstance(inner.value.func, ast.Name) and inner.value.func.id == "cls"
+                for t in inner.targets if _is_cls_attr(t)
+            }
+            if not cached_attrs:
+                continue
+            # An assignment alone could be a factory recording its latest product;
+            # the singleton signature is *reusing* the stored object — a guard
+            # testing it or a return reading it back.
+            reuses = any(
+                (isinstance(inner, ast.If) and any(
+                    _is_cls_attr(n) and n.attr in cached_attrs
+                    for n in ast.walk(inner.test)))
+                or (isinstance(inner, ast.Return) and inner.value is not None
+                    and _is_cls_attr(inner.value) and inner.value.attr in cached_attrs)
+                for inner in ast.walk(method)
+            )
+            if reuses:
+                self._add(method.lineno, "handrolled_singleton",
+                    f"'{node.name}.{method.name}' is a get-instance accessor caching a "
+                    "single instance — a hand-rolled Singleton",
+                    "Create the instance once at module level and import it (Global Object "
+                    "pattern), or use a module-level @functools.cache factory function. "
+                    "Callers should receive the object, not fetch it", "medium")
+                return
 
     def _check_singleton_metaclass(self, node: ast.ClassDef):
         """Metaclass whose __call__ caches the result of super().__call__."""
         for method in _methods(node):
             if method.name != "__call__":
                 continue
-            caches = any(_is_super_call_to(inner.value, "__call__")
-                         for inner in ast.walk(method)
-                         if isinstance(inner, ast.Assign))
+            # The instance must be written to *persistent* storage (a subscript
+            # like cls._instances[cls], or an attribute) — assigning
+            # super().__call__() to a local for validation is not caching.
+            caches = any(
+                _is_super_call_to(inner.value, "__call__")
+                and any(isinstance(t, (ast.Subscript, ast.Attribute)) for t in inner.targets)
+                for inner in ast.walk(method)
+                if isinstance(inner, ast.Assign)
+            )
             gated = any(isinstance(inner, ast.If) for inner in ast.walk(method))
             if caches and gated:
                 self._add(node.lineno, "handrolled_singleton",
@@ -213,13 +247,32 @@ class PatternIssueDetector(ast.NodeVisitor):
 
     def _check_borg(self, node: ast.ClassDef):
         """self.__dict__ = <shared> in __init__ (Borg / Monostate)."""
+        # Only storage that is actually shared counts: a class-level dict
+        # attribute or a module-level dict. `self.__dict__ = state` restoring a
+        # per-instance snapshot (deserialization) shares nothing.
+        class_dicts = {
+            t.id
+            for stmt in node.body if isinstance(stmt, ast.Assign)
+            and (isinstance(stmt.value, ast.Dict)
+                 or (isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name)
+                     and stmt.value.func.id == "dict"))
+            for t in stmt.targets if isinstance(t, ast.Name)
+        }
+
+        def is_shared(value: ast.expr) -> bool:
+            if isinstance(value, ast.Attribute):
+                return value.attr in class_dicts and (
+                    isinstance(value.value, ast.Name)
+                    and value.value.id in ("self", "cls", node.name))
+            return isinstance(value, ast.Name) and value.id in self.module_dicts
+
         for method in _methods(node):
             if method.name != "__init__":
                 continue
             for inner in ast.walk(method):
                 if isinstance(inner, ast.Assign) \
                         and any(_is_self_attr(t, "__dict__") for t in inner.targets) \
-                        and isinstance(inner.value, (ast.Attribute, ast.Name)):
+                        and is_shared(inner.value):
                     self._add(inner.lineno, "borg_shared_state",
                         f"'{node.name}' shares one __dict__ across instances (Borg/Monostate)",
                         "Shared state without shared identity is still hidden global state. "
@@ -301,8 +354,10 @@ class PatternIssueDetector(ast.NodeVisitor):
                 self._add(method.lineno, "handrolled_lazy_property",
                     f"'{node.name}.{method.name}' is a hand-rolled lazy property "
                     f"(None-check on self.{attr})",
-                    "Use @functools.cached_property — same laziness, one decorator, "
-                    "no sentinel field", "low")
+                    "Use @functools.cached_property — one decorator, no sentinel field. "
+                    "Verify equivalence first: cached_property caches None (this form "
+                    f"retries), and invalidation becomes `del obj.{method.name}` instead "
+                    f"of resetting self.{attr}", "low")
 
     @staticmethod
     def _none_check_attr(test: ast.expr) -> str | None:
@@ -369,7 +424,15 @@ class PatternIssueDetector(ast.NodeVisitor):
     def _check_finalizer(self, node: ast.ClassDef):
         for method in _methods(node):
             if method.name == "__del__" and _strip_docstring(method.body):
-                if all(isinstance(s, ast.Pass) for s in _strip_docstring(method.body)):
+                # Only a __del__ that performs cleanup is a context-manager
+                # candidate; a diagnostic finalizer (warnings.warn(...,
+                # ResourceWarning)) deliberately reports leaks without cleaning.
+                does_cleanup = any(
+                    isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr in CLEANUP_METHODS
+                    for inner in ast.walk(method)
+                )
+                if not does_cleanup:
                     continue
                 self._add(method.lineno, "finalizer_del",
                     f"'{node.name}.__del__' is used for cleanup",
@@ -430,7 +493,8 @@ class PatternIssueDetector(ast.NodeVisitor):
             ok = True
             for cls in subclasses:
                 body = _strip_docstring(cls.body)
-                if len(body) != 1 or not isinstance(body[0], ast.FunctionDef) \
+                if len(body) != 1 \
+                        or not isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)) \
                         or body[0].name.startswith("_"):
                     ok = False
                     break
@@ -486,7 +550,7 @@ def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for cache in detector.module_dicts:
                 gates = reads = writes = False
-                for inner in ast.walk(node):
+                for inner in _walk_same_scope(node.body):
                     if isinstance(inner, ast.Compare) and len(inner.ops) == 1 \
                             and isinstance(inner.ops[0], (ast.In, ast.NotIn)) \
                             and isinstance(inner.comparators[0], ast.Name) \
@@ -517,10 +581,18 @@ def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
                     and not stmt.value.args and not stmt.value.keywords \
                     and not (isinstance(stmt.value.func.value, ast.Name)
                              and stmt.value.func.value.id in ("self", "cls")):
+                cleanup = stmt.value.func.attr
+                # contextlib.closing() only ever calls .close() — suggesting it
+                # for .release()/.shutdown() would run the wrong (or no) cleanup.
+                fallback = (
+                    "wrap it in contextlib.closing()" if cleanup == "close"
+                    else f"register the call with contextlib.ExitStack "
+                         f"(stack.callback(obj.{cleanup})) or write a small context manager"
+                )
                 add(node.lineno, "try_finally_close",
-                    f"try/finally exists only to call .{stmt.value.func.attr}()",
-                    "Use a with block — the object is probably already a context manager; "
-                    "if not, wrap it in contextlib.closing(). The cleanup then cannot be "
+                    f"try/finally exists only to call .{cleanup}()",
+                    f"Use a with block — the object is probably already a context manager; "
+                    f"if not, {fallback}. The cleanup then cannot be "
                     "forgotten on the next edit", "low")
 
     return issues

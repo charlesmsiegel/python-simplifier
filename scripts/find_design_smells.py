@@ -369,6 +369,11 @@ class DesignSmellDetector(ast.NodeVisitor):
         return real
 
     def _check_refused_bequest(self, node: ast.ClassDef):
+        # Base resolution is module-level only (see class_defs above), so a
+        # *nested* class would have its bases looked up in the wrong scope —
+        # a top-level class sharing the base's name is a different class.
+        if self.class_defs.get(node.name) is not node:
+            return
         inherited: set[str] = set()
         for base in node.bases:
             if isinstance(base, ast.Name) and base.id in self.class_defs:

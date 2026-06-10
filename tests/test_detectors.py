@@ -916,3 +916,123 @@ def test_stateful_strategy_classes_are_not_flagged(tmp_path):
     assert "stateless_strategy_classes" not in smell_types(
         run_detector("find_pattern_issues.py", tmp_path)
     )
+
+
+def test_validating_metaclass_is_not_a_singleton(tmp_path):
+    # An if-gate plus a *local* assignment from super().__call__ is validation,
+    # not instance caching — only persistent storage counts.
+    (tmp_path / "sample.py").write_text(
+        "class ValidatingMeta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        obj = super().__call__(*args, **kwargs)\n"
+        "        if not obj.is_valid():\n"
+        "            raise ValueError(obj)\n"
+        "        return obj\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_instance_factory_recording_latest_is_not_a_singleton(tmp_path):
+    # create_instance() builds a fresh object every call and records the latest;
+    # without a guard/read of the stored attribute it is a factory, not a Singleton.
+    (tmp_path / "sample.py").write_text(
+        "class Widget:\n"
+        "    @classmethod\n"
+        "    def create_instance(cls, name):\n"
+        "        obj = cls(name)\n"
+        "        cls._last_instance = obj\n"
+        "        return obj\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_dict_restore_in_init_is_not_borg(tmp_path):
+    # Restoring per-instance state from a parameter shares nothing.
+    (tmp_path / "sample.py").write_text(
+        "class Snapshot:\n"
+        "    def __init__(self, state):\n"
+        "        self.__dict__ = state\n"
+    )
+    assert "borg_shared_state" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_outer_function_not_blamed_for_nested_memoize(tmp_path):
+    # Only the nested helper hand-rolls memoization; the outer function must not
+    # receive a duplicate, mislocated finding.
+    (tmp_path / "sample.py").write_text(
+        "_CACHE = {}\n"
+        "\n"
+        "def outer(x):\n"
+        "    def helper(k):\n"
+        "        if k in _CACHE:\n"
+        "            return _CACHE[k]\n"
+        "        _CACHE[k] = k * 2\n"
+        "        return _CACHE[k]\n"
+        "    return helper(x)\n"
+    )
+    findings = [f for f in run_detector("find_pattern_issues.py", tmp_path)
+                if f["smell_type"] == "handrolled_memoize"]
+    assert [f["description"] for f in findings] == [
+        "'helper' hand-rolls memoization through module-level dict '_CACHE'"
+    ]
+
+
+def test_warn_only_del_is_not_flagged(tmp_path):
+    # A diagnostic finalizer reports the leak; it does not clean up.
+    (tmp_path / "sample.py").write_text(
+        "import warnings\n"
+        "\n"
+        "class Conn:\n"
+        "    def __del__(self):\n"
+        "        if not self.closed:\n"
+        "            warnings.warn('unclosed Conn', ResourceWarning)\n"
+    )
+    assert "finalizer_del" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_stateless_strategies_are_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Transport:\n"
+        "    async def send(self, payload):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class Http(Transport):\n"
+        "    async def send(self, payload):\n"
+        "        return 'http'\n"
+        "\n"
+        "class Grpc(Transport):\n"
+        "    async def send(self, payload):\n"
+        "        return 'grpc'\n"
+    )
+    assert "stateless_strategy_classes" in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_nested_class_base_not_resolved_against_module_scope(tmp_path):
+    # The nested Child's Base is the container's, not the unrelated top-level
+    # Base — refused_bequest must not fire on the wrong hierarchy.
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'top-level'\n"
+        "\n"
+        "class Container:\n"
+        "    class Base:\n"
+        "        pass\n"
+        "\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
