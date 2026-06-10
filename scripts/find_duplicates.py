@@ -5,7 +5,6 @@ Finds: similar functions, duplicate code blocks, copy-paste code.
 """
 
 import ast
-import sys
 import json
 import hashlib
 import argparse
@@ -54,7 +53,7 @@ def ast_to_hash(node: ast.AST) -> str:
     normalizer = ASTNormalizer()
     normalized = normalizer.visit(ast.fix_missing_locations(node))
     dump = ast.dump(normalized, annotate_fields=False)
-    return hashlib.md5(dump.encode()).hexdigest()[:12]
+    return hashlib.sha256(dump.encode()).hexdigest()[:12]
 
 
 def count_lines(node: ast.AST) -> int:
@@ -199,7 +198,7 @@ def main():
                     print(f"   {line}")
             print()
         
-        print(f"\n💡 Suggestion: Extract duplicate code into shared functions/classes")
+        print("\n💡 Suggestion: Extract duplicate code into shared functions/classes")
 
 
 if __name__ == '__main__':

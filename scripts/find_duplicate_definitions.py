@@ -17,7 +17,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -77,43 +76,44 @@ def _is_property_group(node):
 
 def _check_body_for_duplicates(body, filename, lines, ignore):
     issues = []
-    # Track first-seen line for each (kind, name) pair
-    # kind: "def" for FunctionDef/AsyncFunctionDef, "class" for ClassDef
-    seen = {}  # name -> (kind, lineno)
+    # def and class bind the same namespace, so duplicates are tracked by NAME
+    # alone — a class shadowing a function (or vice versa) is the same bug.
+    seen = {}    # name -> (kind, lineno)
+    exempt = set()  # names that legitimately repeat (overload / property groups)
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            kind = "def"
-            name = node.name
+            kind = "function"
         elif isinstance(node, ast.ClassDef):
             kind = "class"
-            name = node.name
         else:
             continue
+        name = node.name
 
-        # Skip overloads and property groups
+        # Overload sets and property/setter/deleter groups repeat a name on
+        # purpose; once a name participates in one, never flag that name here.
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_overload(node) or _is_property_group(node):
-                # Also skip recording so we don't flag the first non-overload either
-                # Actually: just don't participate in duplicate tracking for this name
-                seen[name] = (kind, node.lineno)  # update so later defs track correctly
-                continue
+                exempt.add(name)
 
-        key = (kind, name)
-        if key in seen:
-            prev_kind, prev_line = seen[key]
+        if name in seen and name not in exempt:
+            prev_kind, prev_line = seen[name]
             st = "duplicate_definition"
             if st not in ignore:
+                what = (
+                    f"{kind.capitalize()} '{name}'"
+                    if prev_kind == kind
+                    else f"{kind.capitalize()} '{name}' (previously a {prev_kind})"
+                )
                 desc = (
-                    f"{'Function' if kind == 'def' else 'Class'} '{name}' is defined "
-                    f"again at line {node.lineno}; the earlier definition at line "
-                    f"{prev_line} is silently shadowed"
+                    f"{what} is defined again at line {node.lineno}; the earlier "
+                    f"definition at line {prev_line} is silently shadowed"
                 )
                 sug = "Remove the duplicate (older) definition, keeping only the intended version."
                 issues.append(CodeSmell(
                     filename, node.lineno, st, desc, sug, "high",
                     _get_line(lines, node.lineno),
                 ))
-        seen[key] = (kind, node.lineno)
+        seen[name] = (kind, node.lineno)
 
     return issues
 
@@ -142,7 +142,7 @@ def _scan_merge_conflicts(source, filename, lines, ignore):
         elif has_open_marker and len(stripped) >= 7 and all(c == "=" for c in stripped):
             issues.append(CodeSmell(
                 filename, lineno, st,
-                f"Merge conflict separator (=======) found",
+                "Merge conflict separator (=======) found",
                 "Resolve the merge conflict and remove all conflict markers.",
                 "high",
                 _get_line(lines, lineno),

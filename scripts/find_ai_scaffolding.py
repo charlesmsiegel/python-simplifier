@@ -16,7 +16,6 @@ Finds:
 """
 
 import ast
-import sys
 import re
 import json
 import argparse

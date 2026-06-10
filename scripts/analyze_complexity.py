@@ -6,7 +6,6 @@ Detects: cyclomatic complexity, cognitive complexity, nesting depth,
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path

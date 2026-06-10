@@ -15,7 +15,6 @@ Finds:
 
 import ast
 import re
-import sys
 import json
 import argparse
 from pathlib import Path

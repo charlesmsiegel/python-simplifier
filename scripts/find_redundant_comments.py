@@ -16,7 +16,6 @@ Finds:
 """
 
 import ast
-import sys
 import re
 import io
 import json
@@ -311,7 +310,6 @@ def detect(tree, filename, lines, ignore):
             continue
 
         if _is_redundant(comment_text, code_line):
-            snippet = tok_line.rstrip()[:80]
             add(
                 lineno,
                 "redundant_comment",

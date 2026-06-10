@@ -10,7 +10,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path

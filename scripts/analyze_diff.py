@@ -21,9 +21,11 @@ Usage:
 """
 
 import re
+import ast
 import sys
 import json
 import argparse
+import contextlib
 import subprocess
 from pathlib import Path
 from collections import defaultdict
@@ -71,8 +73,11 @@ def _git(args):
 
 
 def resolve_base(explicit):
-    """Pick a base ref to diff against."""
+    """Pick a base ref to diff against. Returns None for an invalid explicit ref."""
     if explicit:
+        # A misspelled base must be an error, not an empty (falsely clean) diff.
+        if _git(["rev-parse", "--verify", "--quiet", f"{explicit}^{{commit}}"]) is None:
+            return None
         return explicit
     for candidate in ("origin/main", "origin/master", "main", "master"):
         mb = _git(["merge-base", "HEAD", candidate])
@@ -85,9 +90,14 @@ def resolve_base(explicit):
 
 
 def changed_lines(base):
-    """Return {abs_path: set_of_changed_line_numbers or None (=all lines)}."""
+    """Return {abs_path: set_of_changed_line_numbers or None (=all lines)},
+    or None if git diff itself failed (e.g. unknown base ref)."""
     changed = {}
-    diff = _git(["diff", "--unified=0", "--no-color", base, "--", "*.py"])
+    # core.quotePath=false keeps non-ASCII filenames literal instead of
+    # octal-escaped+quoted, so the paths resolve on the filesystem.
+    diff = _git(["-c", "core.quotePath=false", "diff", "--unified=0", "--no-color", base, "--", "*.py"])
+    if diff is None:
+        return None
     if diff:
         current = None
         for line in diff.splitlines():
@@ -104,7 +114,7 @@ def changed_lines(base):
                     for ln in range(start, start + count):
                         changed[str(Path(current).resolve())].add(ln)
     # Untracked new files: treat every line as changed.
-    others = _git(["ls-files", "--others", "--exclude-standard", "--", "*.py"])
+    others = _git(["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", "*.py"])
     if others:
         for rel in others.splitlines():
             rel = rel.strip()
@@ -114,11 +124,30 @@ def changed_lines(base):
     return {f: lines for f, lines in changed.items() if Path(f).exists()}
 
 
+def _expand_to_definitions(filepath, lines):
+    """Add the `def`/`class` line of every definition whose body intersects the
+    changed lines. Detectors often anchor a finding at the (unchanged) def line
+    even when the change that caused it is inside the body — without this, a
+    diff that adds nesting inside an existing function would be silently clean."""
+    expanded = set(lines)
+    try:
+        tree = ast.parse(Path(filepath).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return expanded
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            if any(node.lineno <= ln <= end for ln in lines):
+                expanded.add(node.lineno)
+    return expanded
+
+
 def run_detector(script, filepath):
     script_path = Path(__file__).parent / script
     if not script_path.exists():
         return []
-    try:
+    # A detector that crashes or emits bad JSON contributes nothing — by design.
+    with contextlib.suppress(subprocess.SubprocessError, json.JSONDecodeError, OSError):
         r = subprocess.run(
             [sys.executable, str(script_path), filepath, "--format", "json"],
             capture_output=True, text=True, timeout=120,
@@ -126,21 +155,22 @@ def run_detector(script, filepath):
         if r.returncode == 0 and r.stdout.strip():
             data = json.loads(r.stdout)
             return data if isinstance(data, list) else data.get("issues", [])
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        pass
     return []
 
 
 def collect(base, all_lines):
     files = changed_lines(base)
+    if files is None:
+        return None, None
     findings = []
     for filepath, lines in files.items():
+        accepted = None if lines is None else _expand_to_definitions(filepath, lines)
         for script in DIFF_SAFE_SCRIPTS:
             for issue in run_detector(script, filepath):
                 if not isinstance(issue, dict):
                     continue
                 ln = issue.get("line")
-                if all_lines or lines is None or (isinstance(ln, int) and ln in lines):
+                if all_lines or accepted is None or (isinstance(ln, int) and ln in accepted):
                     issue.setdefault("severity", "medium")
                     findings.append(issue)
     # De-dupe identical findings (a line can be flagged by overlapping detectors).
@@ -200,10 +230,16 @@ def main():
 
     base = resolve_base(args.base)
     if not base:
-        print("Could not resolve a base ref to diff against.", file=sys.stderr)
+        if args.base:
+            print(f"Base ref '{args.base}' does not resolve to a commit.", file=sys.stderr)
+        else:
+            print("Could not resolve a base ref to diff against.", file=sys.stderr)
         sys.exit(1)
 
     files, findings = collect(base, args.all_lines)
+    if files is None:
+        print(f"git diff against '{base}' failed; refusing to report a falsely clean review.", file=sys.stderr)
+        sys.exit(1)
 
     if args.format == "json":
         print(json.dumps(findings, indent=2))

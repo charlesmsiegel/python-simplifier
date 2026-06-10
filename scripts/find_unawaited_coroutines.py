@@ -13,7 +13,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -61,24 +60,78 @@ def _is_wrapper_call(node):
 
 
 def _collect_async_names(tree):
-    """Collect all names defined as async def anywhere in the module."""
-    names = set()
+    """
+    Collect two separate sets of async-def names:
+      - free_async: async def functions NOT directly inside a class body
+        (top-level, nested inside other functions, etc.)
+      - method_async: async def methods defined directly inside a class body
+
+    Returns (free_async, method_async).
+    """
+    free_async = set()
+    method_async = set()
+
+    # Collect names of functions defined directly in class bodies
+    class_method_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, ast.AsyncFunctionDef):
+                    class_method_names.add(item.name)
+
+    # Walk all async defs; those not in class_method_names are "free"
+    # (This may double-count a name that appears both as a free function
+    # and a method, but that's conservative — we only use sets for matching.)
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef):
-            names.add(node.name)
-    return names
+            # Check if this node is directly in a class body
+            # We can't easily check parent context via ast.walk, so use the
+            # class_method_names set as a proxy — if the name appears as a
+            # direct class body member, treat it as a method name.
+            # A name that is ONLY a class method goes in method_async;
+            # a name that appears as a free function goes in free_async.
+            pass  # handled below via parent tracking
+
+    # Use a parent-tracking walk to accurately classify each AsyncFunctionDef
+    free_async = set()
+    method_async = set()
+
+    def _walk_with_parent(node, parent):
+        if isinstance(node, ast.AsyncFunctionDef):
+            if isinstance(parent, ast.ClassDef):
+                method_async.add(node.name)
+            else:
+                free_async.add(node.name)
+        for child in ast.iter_child_nodes(node):
+            _walk_with_parent(child, node)
+
+    _walk_with_parent(tree, None)
+    return free_async, method_async
 
 
-def _call_target_name(call_node):
+def _is_self_cls_call(call_node):
     """
-    Return the bare function name for a Call node, or None if not applicable.
-    Handles: name(...) and obj.name(...).
+    Return the method name if call_node is a Call of the form self.name(...)
+    or cls.name(...), else return None.
+    """
+    func = call_node.func
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id in {"self", "cls"}
+    ):
+        return func.attr
+    return None
+
+
+def _is_bare_name_call(call_node):
+    """
+    Return the function name if call_node is a bare Name call f(...),
+    else return None.
     """
     func = call_node.func
     if isinstance(func, ast.Name):
         return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
     return None
 
 
@@ -88,8 +141,8 @@ def detect(tree, filename, lines, ignore):
     if st in ignore:
         return issues
 
-    async_names = _collect_async_names(tree)
-    if not async_names:
+    free_async, method_async = _collect_async_names(tree)
+    if not free_async and not method_async:
         return issues
 
     def add(lineno, name):
@@ -106,6 +159,26 @@ def detect(tree, filename, lines, ignore):
             _get_line(lines, lineno),
         ))
 
+    def _check_call(call):
+        """
+        Return the async name if this call should be flagged, else None.
+
+        Rules:
+          - bare Name call f() → flag only if f is in free_async
+          - self.method() / cls.method() → flag only if method is in method_async
+          - any other attribute call → never flag
+        """
+        bare = _is_bare_name_call(call)
+        if bare is not None:
+            if bare in free_async:
+                return bare
+            return None
+        method = _is_self_cls_call(call)
+        if method is not None:
+            if method in method_async:
+                return method
+        return None
+
     # Walk the AST looking for:
     # 1. ast.Expr whose value is a Call to an async name (discarded expression)
     # 2. ast.If / ast.While whose test is a Call to an async name
@@ -113,22 +186,20 @@ def detect(tree, filename, lines, ignore):
         # Case (a): bare expression statement  — `f()`
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
-            name = _call_target_name(call)
-            if name and name in async_names:
-                # Must not be wrapped in await (it can't be in ast.Expr.value
-                # form without await, but be safe) or a wrapper call
-                # ast.Expr.value is the call itself; it cannot be an Await here
-                # because `await f()` parses as Expr(value=Await(value=Call(...)))
-                if not _is_wrapper_call(call):
+            # ast.Expr.value cannot be an Await; await f() parses as
+            # Expr(value=Await(value=Call(...))) so no double-check needed
+            if not _is_wrapper_call(call):
+                name = _check_call(call)
+                if name:
                     add(call.lineno, name)
 
         # Case (b): condition of if/while — `if f():` / `while f():`
         elif isinstance(node, (ast.If, ast.While)):
             test = node.test
             if isinstance(test, ast.Call):
-                name = _call_target_name(test)
-                if name and name in async_names:
-                    if not _is_wrapper_call(test):
+                if not _is_wrapper_call(test):
+                    name = _check_call(test)
+                    if name:
                         add(test.lineno, name)
 
     return issues

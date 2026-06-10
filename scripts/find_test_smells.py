@@ -13,7 +13,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -111,15 +110,11 @@ def _is_pytest_raises_with(node: ast.stmt) -> bool:
 
 
 def _has_assertion(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """Return True if the function body contains ANY assertion."""
-    for node in ast.walk(func_node):
-        if isinstance(node, ast.Assert):
-            return True
-        if isinstance(node, ast.Expr) and _is_assert_call(node.value):
-            return True
-        if _is_pytest_raises_with(node):
-            return True
-    return False
+    """
+    Return True if the function body contains ANY assertion in its own scope,
+    without descending into nested function/class/lambda definitions.
+    """
+    return bool(_collect_assertions(func_node))
 
 
 # ---------------------------------------------------------------------------

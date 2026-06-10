@@ -5,7 +5,6 @@ Finds: Feature Envy, Low Cohesion (LCOM), Message Chains, Middle Man.
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -91,8 +90,7 @@ class ClassAnalyzer(ast.NodeVisitor):
     def _analyze_class(self, node: ast.ClassDef):
         class_name = node.name
         methods = self.class_methods[class_name]
-        attrs = self.class_attributes[class_name]
-        
+
         if not methods or len(methods) < 2:
             return
         

@@ -21,7 +21,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -190,15 +189,15 @@ def detect(tree, filename, lines, ignore):
                   and func.value.id == "subprocess"
                   and func.attr in _SUBPROCESS_FUNCS
                   and node.args
-                  and _is_dynamic_string(node.args[0])):
-                has_shell = (
-                    _keyword_value(node, "shell") is not None
-                    and not _is_false_literal(_keyword_value(node, "shell"))
-                )
-                detail = " (shell=True makes this worse)" if has_shell else ""
+                  and _is_dynamic_string(node.args[0])
+                  # Without shell=True the string is an executable path, not a
+                  # shell command — metacharacters aren't interpreted, so this
+                  # is only injection when a shell is actually invoked.
+                  and _keyword_value(node, "shell") is not None
+                  and not _is_false_literal(_keyword_value(node, "shell"))):
                 add(node.lineno, "command_injection",
-                    f"subprocess.{func.attr}() is called with a dynamically built command string{detail}",
-                    "Pass an argument list (e.g. [\"ls\", d]) and avoid shell=True; "
+                    f"subprocess.{func.attr}() runs a dynamically built command string through the shell (shell=True)",
+                    "Pass an argument list (e.g. [\"ls\", d]) with shell=False; "
                     "never interpolate values into a shell string.",
                     "high")
 
@@ -267,9 +266,9 @@ def detect(tree, filename, lines, ignore):
                   and func.value.id == "hashlib"):
                 add(node.lineno, "weak_hash",
                     f"hashlib.{func.attr}() is a cryptographically weak hash algorithm",
-                    f"Use hashlib.sha256() or stronger for security-sensitive uses. "
-                    f"If only used for checksums, add usedforsecurity=False (Python 3.9+) "
-                    f"to suppress this warning.",
+                    "Use hashlib.sha256() or stronger for security-sensitive uses. "
+                    "If only used for checksums, add usedforsecurity=False (Python 3.9+) "
+                    "to suppress this warning.",
                     "medium")
 
             # ---------------------------------------------------------------- #

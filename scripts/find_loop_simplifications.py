@@ -12,7 +12,6 @@ included so the suite is self-contained.)
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path

@@ -14,7 +14,6 @@ the suite is self-contained for repos that don't run those.)
 
 import ast
 import re
-import sys
 import json
 import argparse
 from pathlib import Path

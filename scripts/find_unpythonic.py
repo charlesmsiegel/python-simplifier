@@ -5,7 +5,6 @@ Finds: non-idiomatic patterns that have cleaner Pythonic alternatives.
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path

@@ -18,7 +18,6 @@ Deliberately NOT flagged (the legitimate deferred-import patterns):
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path

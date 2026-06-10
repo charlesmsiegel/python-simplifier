@@ -11,7 +11,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -70,6 +69,157 @@ def _collect_with_context_exprs(tree) -> set:
     return managed
 
 
+def _enclosing_scope_stmts(tree, assign_node):
+    """
+    Return the list of statements forming the body of the nearest enclosing
+    FunctionDef, AsyncFunctionDef, or Module that contains assign_node.
+    Returns None if not found (shouldn't happen in a valid tree).
+
+    We do a parent-tracking walk to find the nearest enclosing scope.
+    """
+    # Build a parent map: node_id -> parent_node
+    parent = {}
+    for p in ast.walk(tree):
+        for child in ast.iter_child_nodes(p):
+            parent[id(child)] = p
+
+    node = assign_node
+    while id(node) in parent:
+        p = parent[id(node)]
+        if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            return p.body
+        node = p
+    # Fallback: module body
+    return tree.body
+
+
+def _scope_has_close_call(scope_stmts, var_name: str) -> bool:
+    """
+    Return True if the scope body (list of stmts) contains a call
+    `var_name.close()` without descending into nested function defs.
+    """
+    def _walk_stmts(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # don't descend into nested scopes
+            # Check this statement for a close() call
+            for node in ast.walk(stmt):
+                # Don't descend into nested function/class within walk results
+                # (ast.walk does descend, but we'll check after)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "close"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == var_name
+                ):
+                    return True
+        return False
+
+    # We need a version that doesn't descend into nested functions.
+    # ast.walk descends everywhere, so use a manual traversal instead.
+    def _check_node(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False  # don't descend
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "close"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == var_name
+        ):
+            return True
+        for child in ast.iter_child_nodes(node):
+            if _check_node(child):
+                return True
+        return False
+
+    for stmt in scope_stmts:
+        if _check_node(stmt):
+            return True
+    return False
+
+
+def _scope_has_return_of(scope_stmts, var_name: str) -> bool:
+    """
+    Return True if the scope body contains `return var_name` (ownership transfer),
+    without descending into nested function defs.
+    """
+    def _check_node(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        if isinstance(node, ast.Return) and node.value is not None:
+            if isinstance(node.value, ast.Name) and node.value.id == var_name:
+                return True
+        for child in ast.iter_child_nodes(node):
+            if _check_node(child):
+                return True
+        return False
+
+    for stmt in scope_stmts:
+        if _check_node(stmt):
+            return True
+    return False
+
+
+def _scope_has_self_store(scope_stmts, var_name: str) -> bool:
+    """
+    Return True if the scope body contains `self.x = var_name` (ownership
+    transfer to object), without descending into nested function defs.
+    """
+    def _check_node(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        # Assign: self.x = var_name
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    if target.value.id == "self":
+                        if isinstance(node.value, ast.Name) and node.value.id == var_name:
+                            return True
+        for child in ast.iter_child_nodes(node):
+            if _check_node(child):
+                return True
+        return False
+
+    for stmt in scope_stmts:
+        if _check_node(stmt):
+            return True
+    return False
+
+
+def _get_assign_var_name(node) -> str | None:
+    """
+    For a simple single-target assignment like `x = ...` or annotated `x: T = ...`,
+    return the variable name string. Returns None for complex targets.
+    """
+    if isinstance(node, ast.Assign):
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            return node.targets[0].id
+    elif isinstance(node, ast.AnnAssign):
+        if isinstance(node.target, ast.Name):
+            return node.target.id
+    return None
+
+
+def _is_suppressed(tree, assign_node) -> bool:
+    """
+    Return True if the flagged assignment should be suppressed because the
+    resource is explicitly closed, returned, or stored on self in the same scope.
+    """
+    var_name = _get_assign_var_name(assign_node)
+    if var_name is None:
+        return False  # complex assignment — can't analyse, don't suppress
+
+    scope_stmts = _enclosing_scope_stmts(tree, assign_node)
+
+    return (
+        _scope_has_close_call(scope_stmts, var_name)
+        or _scope_has_return_of(scope_stmts, var_name)
+        or _scope_has_self_store(scope_stmts, var_name)
+    )
+
+
 def detect(tree, filename, lines, ignore):
     issues = []
 
@@ -88,37 +238,41 @@ def detect(tree, filename, lines, ignore):
                 continue
 
             if _is_open_call(value):
-                add(
-                    node.lineno,
-                    "unmanaged_open",
-                    "open() result assigned without a context manager — file handle may leak",
-                    "Use `with open(...) as f:` so the handle is closed deterministically.",
-                    "high",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_open",
+                        "open() result assigned without a context manager — file handle may leak",
+                        "Use `with open(...) as f:` so the handle is closed deterministically.",
+                        "high",
+                    )
             elif _is_attr_call(value, "socket", "socket"):
-                add(
-                    node.lineno,
-                    "unmanaged_resource",
-                    "socket.socket() result assigned without a context manager — socket may leak",
-                    "Use `with socket.socket(...) as s:` so the socket is closed deterministically.",
-                    "medium",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_resource",
+                        "socket.socket() result assigned without a context manager — socket may leak",
+                        "Use `with socket.socket(...) as s:` so the socket is closed deterministically.",
+                        "medium",
+                    )
             elif _is_attr_call(value, "tempfile", "NamedTemporaryFile"):
-                add(
-                    node.lineno,
-                    "unmanaged_resource",
-                    "tempfile.NamedTemporaryFile() assigned without a context manager — resource may leak",
-                    "Use `with tempfile.NamedTemporaryFile(...) as f:` so the file is cleaned up deterministically.",
-                    "medium",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_resource",
+                        "tempfile.NamedTemporaryFile() assigned without a context manager — resource may leak",
+                        "Use `with tempfile.NamedTemporaryFile(...) as f:` so the file is cleaned up deterministically.",
+                        "medium",
+                    )
             elif _is_attr_call(value, "tempfile", "TemporaryFile"):
-                add(
-                    node.lineno,
-                    "unmanaged_resource",
-                    "tempfile.TemporaryFile() assigned without a context manager — resource may leak",
-                    "Use `with tempfile.TemporaryFile(...) as f:` so the file is cleaned up deterministically.",
-                    "medium",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_resource",
+                        "tempfile.TemporaryFile() assigned without a context manager — resource may leak",
+                        "Use `with tempfile.TemporaryFile(...) as f:` so the file is cleaned up deterministically.",
+                        "medium",
+                    )
 
         # --- AnnAssign: x: T = open(...) ---
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
@@ -127,37 +281,41 @@ def detect(tree, filename, lines, ignore):
                 continue
 
             if _is_open_call(value):
-                add(
-                    node.lineno,
-                    "unmanaged_open",
-                    "open() result assigned without a context manager — file handle may leak",
-                    "Use `with open(...) as f:` so the handle is closed deterministically.",
-                    "high",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_open",
+                        "open() result assigned without a context manager — file handle may leak",
+                        "Use `with open(...) as f:` so the handle is closed deterministically.",
+                        "high",
+                    )
             elif _is_attr_call(value, "socket", "socket"):
-                add(
-                    node.lineno,
-                    "unmanaged_resource",
-                    "socket.socket() result assigned without a context manager — socket may leak",
-                    "Use `with socket.socket(...) as s:` so the socket is closed deterministically.",
-                    "medium",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_resource",
+                        "socket.socket() result assigned without a context manager — socket may leak",
+                        "Use `with socket.socket(...) as s:` so the socket is closed deterministically.",
+                        "medium",
+                    )
             elif _is_attr_call(value, "tempfile", "NamedTemporaryFile"):
-                add(
-                    node.lineno,
-                    "unmanaged_resource",
-                    "tempfile.NamedTemporaryFile() assigned without a context manager — resource may leak",
-                    "Use `with tempfile.NamedTemporaryFile(...) as f:` so the file is cleaned up deterministically.",
-                    "medium",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_resource",
+                        "tempfile.NamedTemporaryFile() assigned without a context manager — resource may leak",
+                        "Use `with tempfile.NamedTemporaryFile(...) as f:` so the file is cleaned up deterministically.",
+                        "medium",
+                    )
             elif _is_attr_call(value, "tempfile", "TemporaryFile"):
-                add(
-                    node.lineno,
-                    "unmanaged_resource",
-                    "tempfile.TemporaryFile() assigned without a context manager — resource may leak",
-                    "Use `with tempfile.TemporaryFile(...) as f:` so the file is cleaned up deterministically.",
-                    "medium",
-                )
+                if not _is_suppressed(tree, node):
+                    add(
+                        node.lineno,
+                        "unmanaged_resource",
+                        "tempfile.TemporaryFile() assigned without a context manager — resource may leak",
+                        "Use `with tempfile.TemporaryFile(...) as f:` so the file is cleaned up deterministically.",
+                        "medium",
+                    )
 
         # --- Expr: open(p).read() style — open() result immediately used, no with ---
         elif isinstance(node, ast.Expr):

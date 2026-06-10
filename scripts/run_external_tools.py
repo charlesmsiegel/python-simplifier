@@ -27,8 +27,8 @@ import sys
 import json
 import shutil
 import argparse
+import contextlib
 import subprocess
-from pathlib import Path
 from collections import defaultdict
 
 _ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -41,13 +41,12 @@ def _invocation(name, module):
     exe = shutil.which(name)
     if exe:
         return [exe]
-    try:
+    # If `python -m <tool>` can't run, the tool just isn't available here.
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
         r = subprocess.run([sys.executable, "-m", module, "--version"],
                            capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
             return [sys.executable, "-m", module]
-    except (OSError, subprocess.SubprocessError):
-        pass
     return None
 
 
@@ -75,8 +74,18 @@ def _finding(tool, file, line, code, msg, severity):
 
 # ---- per-tool runners (check mode) --------------------------------------- #
 
+def _tool_error(tool, path, rc, err):
+    detail = (err or "").strip().splitlines()
+    detail = detail[-1][:200] if detail else f"exit code {rc}"
+    return _finding(tool, path, 1, "tool-error",
+                    f"{tool} did not complete ({detail}) — its results are missing from this report", "medium")
+
+
 def run_ruff(inv, path):
     rc, out, err = _run([*inv, "check", "--output-format", "json", "--quiet", path])
+    # ruff exits 0 (clean) or 1 (findings); anything else means it didn't run.
+    if rc not in (0, 1):
+        return [_tool_error("ruff", path, rc, err)]
     findings = []
     try:
         for d in json.loads(out or "[]"):
@@ -85,12 +94,15 @@ def run_ruff(inv, path):
             loc = d.get("location") or {}
             findings.append(_finding("ruff", d.get("filename", path), loc.get("row"), code, d.get("message", ""), sev))
     except json.JSONDecodeError:
-        pass
+        return [_tool_error("ruff", path, rc, err or "unparseable JSON output")]
     return findings
 
 
 def run_mypy(inv, path):
     rc, out, err = _run([*inv, "--no-error-summary", "--no-color-output", "--show-error-codes", path])
+    # mypy exits 0 (clean) or 1 (type errors); 2/None means it failed to run.
+    if rc not in (0, 1):
+        return [_tool_error("mypy", path, rc, err)]
     findings = []
     for line in (out or "").splitlines():
         m = _MYPY_RE.match(line.strip())
@@ -104,6 +116,9 @@ def run_mypy(inv, path):
 
 def run_bandit(inv, path):
     rc, out, err = _run([*inv, "-q", "-r", "-f", "json", path])
+    # bandit exits 0 (clean) or 1 (findings); other codes mean it failed.
+    if rc not in (0, 1):
+        return [_tool_error("bandit", path, rc, err)]
     findings = []
     try:
         data = json.loads(out or "{}")
@@ -112,12 +127,15 @@ def run_bandit(inv, path):
             findings.append(_finding("bandit", d.get("filename", path), d.get("line_number"),
                                      d.get("test_id", ""), d.get("issue_text", ""), sev))
     except json.JSONDecodeError:
-        pass
+        return [_tool_error("bandit", path, rc, err or "unparseable JSON output")]
     return findings
 
 
 def run_flake8(inv, path):
     rc, out, err = _run([*inv, path])
+    # flake8 exits 0 (clean) or 1 (findings); other codes mean it failed.
+    if rc not in (0, 1):
+        return [_tool_error("flake8", path, rc, err)]
     findings = []
     for line in (out or "").splitlines():
         m = _FLAKE8_RE.match(line.strip())
@@ -131,8 +149,11 @@ def run_flake8(inv, path):
 
 def run_black(inv, path):
     rc, out, err = _run([*inv, "--check", "--quiet", path])
+    # black exits 0 (clean) or 1 (would reformat); other codes mean it failed.
+    if rc not in (0, 1):
+        return [_tool_error("black", path, rc, err)]
     findings = []
-    if rc not in (0, None):
+    if rc == 1:
         for m in re.finditer(r"would reformat (.+)", (err or "") + (out or "")):
             findings.append(_finding("black", m.group(1).strip(), 1, "format", "File is not black-formatted", "low"))
         if not findings:
@@ -142,8 +163,11 @@ def run_black(inv, path):
 
 def run_isort(inv, path):
     rc, out, err = _run([*inv, "--check-only", path])
+    # isort exits 0 (clean) or 1 (unsorted); other codes mean it failed.
+    if rc not in (0, 1):
+        return [_tool_error("isort", path, rc, err)]
     findings = []
-    if rc not in (0, None):
+    if rc == 1:
         for m in re.finditer(r"ERROR:\s*(.+?)\s+Imports are incorrectly sorted", (err or "") + (out or "")):
             findings.append(_finding("isort", m.group(1).strip(), 1, "imports", "Imports are not sorted/grouped", "low"))
         if not findings:
@@ -196,15 +220,17 @@ def main():
         else:
             missing.append({"name": name, "install": f"pip install {pkg}"})
 
+    # Apply fixes FIRST so the findings below describe the post-fix state —
+    # otherwise the report would list issues the formatters just resolved.
+    fix_notes = apply_fixes(available, args.path) if args.fix else []
+
     findings = []
     for name, inv in available.items():
         runner = TOOLS[name][2]
         try:
             findings.extend(runner(inv, args.path))
         except Exception as e:  # one tool failing must not sink the rest
-            findings.append(_finding(name, args.path, 1, "tool-error", f"{name} failed to run: {e}", "low"))
-
-    fix_notes = apply_fixes(available, args.path) if args.fix else []
+            findings.append(_finding(name, args.path, 1, "tool-error", f"{name} failed to run: {e}", "medium"))
 
     rank = {"high": 0, "medium": 1, "low": 2}
     findings.sort(key=lambda f: (rank.get(f["severity"], 1), str(f["file"]), f["line"]))

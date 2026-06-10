@@ -10,7 +10,6 @@ import argparse
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
 
 
 def run_analyzer(script_name: str, path: str) -> dict:
@@ -131,7 +130,10 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
         'meta': {
             'analyzed_path': path,
             'timestamp': datetime.now().isoformat(),
-            'analyzers_run': list(results.keys())
+            'analyzers_run': list(results.keys()),
+            # category -> error string for every analyzer that did not complete.
+            # A zero count for one of these categories means "unknown", not "clean".
+            'analyzer_errors': {}
         },
         'summary': {
             'total_issues': 0,
@@ -148,6 +150,8 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
         elif isinstance(data, dict):
             if 'issues' in data:
                 issues = data['issues']
+            if data.get('error'):
+                report['meta']['analyzer_errors'][category] = str(data['error'])
 
         normalized = []
         for issue in issues:
@@ -202,8 +206,19 @@ def print_text_report(report: dict):
             print(f"  {cat}: {count}")
     print()
 
+    analyzer_errors = meta.get('analyzer_errors') or {}
+    if analyzer_errors:
+        print("⚠️  ANALYSIS INCOMPLETE — these analyzers did not finish; their")
+        print("    categories show what was found before failure, not a clean bill:")
+        for cat, err in sorted(analyzer_errors.items()):
+            print(f"    • {cat}: {err}")
+        print()
+
     if summary['total_issues'] == 0:
-        print("✅ No issues found! Your code looks great!")
+        if analyzer_errors:
+            print("No issues found by the analyzers that completed (see warnings above).")
+        else:
+            print("✅ No issues found! Your code looks great!")
         return
 
     print("=" * 70)

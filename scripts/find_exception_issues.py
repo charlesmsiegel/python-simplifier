@@ -18,7 +18,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -225,7 +224,7 @@ class ExceptionIssueDetector(ast.NodeVisitor):
                 return True
         return False
 
-    _LOG_ATTRS = {"warning", "warn", "error", "exception", "critical", "fatal"}
+    _LOG_ATTRS = frozenset({"warning", "warn", "error", "exception", "critical", "fatal"})
 
     @staticmethod
     def _body_has_log_call(body) -> bool:

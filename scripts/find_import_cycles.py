@@ -10,12 +10,12 @@ Analyzes the whole directory tree and flags:
 """
 
 import ast
-import sys
 import json
 import argparse
+import contextlib
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator, Dict, List, Set, Optional, Tuple
+from typing import Iterator, Dict, List, Set, Optional
 from collections import defaultdict
 
 
@@ -53,25 +53,77 @@ def _get_line(lines: List[str], lineno: int) -> str:
 # Module-name mapping
 # ---------------------------------------------------------------------------
 
+def _find_package_root(directory: Path) -> Path:
+    """Walk UP from directory while __init__.py exists; return the topmost such dir.
+
+    The module name is then derived from the package root's PARENT.  A lone
+    file in a directory without __init__.py has no package root (the directory
+    itself is the implicit namespace root).
+    """
+    pkg_root = directory
+    while (pkg_root / "__init__.py").exists():
+        parent = pkg_root.parent
+        if parent == pkg_root:
+            # Filesystem root – stop
+            break
+        pkg_root = parent
+    # pkg_root is now the first directory going up that does NOT contain
+    # __init__.py, so the actual package root is one level back down.
+    # Re-derive: the package boundary is the deepest directory that still has
+    # __init__.py.  We overshot by one, so back up.
+    actual_pkg_root = directory
+    while (actual_pkg_root / "__init__.py").exists():
+        parent = actual_pkg_root.parent
+        if parent == actual_pkg_root:
+            break
+        actual_pkg_root = parent
+    # actual_pkg_root is the first ancestor WITHOUT __init__.py — it is the
+    # parent of the package root.
+    return actual_pkg_root
+
+
 def _build_module_map(root: Path, py_files: List[Path]) -> Dict[Path, str]:
-    """Return {absolute_path: dotted_module_name} relative to root."""
+    """Return {absolute_path: dotted_module_name} using package-boundary resolution.
+
+    For each file, we walk UP from its directory while __init__.py is present.
+    The topmost directory that still has __init__.py is the package root; its
+    parent is used as the base for computing the dotted name.
+
+    Example:  src/pkg/__init__.py exists, src/__init__.py does NOT.
+              src/pkg/a.py  →  package root = src/pkg, base = src
+              dotted name = "pkg.a"
+
+    A lone top-level module (no __init__.py in its directory) keeps its stem.
+    """
     mapping: Dict[Path, str] = {}
     for p in py_files:
+        p_abs = p.resolve()
+        directory = p_abs.parent
+
+        # Find the base directory (first ancestor without __init__.py)
+        base = _find_package_root(directory)
+
         try:
-            rel = p.relative_to(root)
+            rel = p_abs.relative_to(base)
         except ValueError:
-            continue
+            # File is not under base — fall back to root-relative path
+            try:
+                rel = p_abs.relative_to(root)
+            except ValueError:
+                continue
+
         parts = list(rel.parts)
         if parts[-1] == "__init__.py":
             parts = parts[:-1]
             if not parts:
-                # root/__init__.py  — unlikely but skip
+                # base/__init__.py — shouldn't happen given algorithm, but skip
                 continue
             dotted = ".".join(parts)
         else:
             parts[-1] = parts[-1][:-3]  # strip .py
             dotted = ".".join(parts)
-        mapping[p.resolve()] = dotted
+
+        mapping[p_abs] = dotted
     return mapping
 
 
@@ -87,9 +139,39 @@ def _module_to_path(module_name: str, root: Path) -> Optional[Path]:
     return None
 
 
-def _resolve_relative_import(level: int, module: Optional[str], file_path: Path, root: Path) -> Optional[str]:
-    """Resolve a relative import to a dotted module name."""
-    # Walk up `level` packages from file_path
+def _resolve_relative_import(
+    level: int,
+    module: Optional[str],
+    file_path: Path,
+    root: Path,
+    file_mod_name: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a relative import to a dotted module name.
+
+    When *file_mod_name* is provided (the package-boundary-derived dotted name
+    for *file_path*), use it as the authoritative base for relative resolution
+    instead of computing the path relative to *root*.  This handles src/ layouts
+    where the file's dotted name is e.g. "pkg.a" even though the file lives at
+    "src/pkg/a.py".
+    """
+    if file_mod_name is not None:
+        # Derive the package parts from the file's own module name.
+        # For a module "pkg.a" the package is ["pkg"]; for "pkg.sub.a" it's ["pkg", "sub"].
+        # level=1 means "current package"; level=2 means "one package up", etc.
+        mod_parts = file_mod_name.split(".")
+        # Drop the file's own name to get the package parts
+        pkg_parts = mod_parts[:-1]
+        # Walk up (level - 1) more package levels
+        for _ in range(level - 1):
+            if pkg_parts:
+                pkg_parts = pkg_parts[:-1]
+        if module:
+            full = ".".join(pkg_parts + module.split(".")) if pkg_parts else module
+        else:
+            full = ".".join(pkg_parts) if pkg_parts else None
+        return full
+
+    # Fallback: derive from filesystem path relative to root (original behaviour)
     pkg_path = file_path.parent
     for _ in range(level - 1):
         pkg_path = pkg_path.parent
@@ -120,6 +202,8 @@ def _collect_imported_modules(
 ) -> List[str]:
     """Return list of project module names imported by this file."""
     imported: List[str] = []
+    # The package-boundary-derived module name for this file (may be None if unmapped)
+    file_mod_name: Optional[str] = mod_map.get(file_path.resolve())
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -136,8 +220,11 @@ def _collect_imported_modules(
             module = node.module  # may be None for `from . import x`
 
             if level > 0:
-                # Relative import
-                resolved = _resolve_relative_import(level, module, file_path, root)
+                # Relative import — use the file's package-boundary module name
+                # so that src/ layouts resolve correctly.
+                resolved = _resolve_relative_import(
+                    level, module, file_path, root, file_mod_name=file_mod_name
+                )
                 if resolved and resolved in name_to_path:
                     imported.append(resolved)
                 elif resolved:
@@ -321,12 +408,11 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     trees: Dict[Path, ast.AST] = {}
     file_lines: Dict[Path, List[str]] = {}
     for fp in py_files:
-        try:
+        # Unreadable/unparseable files are skipped by design.
+        with contextlib.suppress(Exception):
             source = fp.read_text(encoding="utf-8", errors="replace")
             trees[fp.resolve()] = ast.parse(source, filename=str(fp))
             file_lines[fp.resolve()] = source.splitlines()
-        except (SyntaxError, Exception):
-            pass
 
     issues: List[CodeSmell] = []
 

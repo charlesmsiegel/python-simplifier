@@ -241,7 +241,26 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     req_files = _collect_requirements_files(root)
     pyproject_deps = _collect_pyproject_deps(root)
 
-    has_manifest = bool(req_files) or bool(pyproject_deps)
+    # Manifest presence is about the FILE existing (and parsing), not about how
+    # many deps it declares — an intentionally-empty dependency list is still a
+    # manifest, and undeclared imports against it are missing_dependency, not
+    # no_dependency_manifest.
+    def _pyproject_parses() -> bool:
+        pyproject = root / "pyproject.toml"
+        if not pyproject.exists() or tomllib is None:
+            return False
+        try:
+            tomllib.loads(pyproject.read_text(encoding="utf-8", errors="replace"))
+            return True
+        except Exception:
+            return False
+
+    has_manifest = (
+        bool(req_files)
+        or bool(pyproject_deps)
+        or bool(list(root.rglob("requirements*.txt")))
+        or _pyproject_parses()
+    )
 
     # Build set of normalized declared names and lookup for location
     # declared_norm -> (source_file, lineno)
@@ -357,10 +376,8 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     # 6. unused_dependency: declared but never imported
     # ------------------------------------------------------------------ #
     if "unused_dependency" not in ignore:
-        # Build set of normalized imported module names
-        imported_norms = {_normalize(m) for m in third_party_imports}
-        # Also include stdlib/local under their normalized names for the
-        # reverse mapping (in case a dist name matches a stdlib module)
+        # A declared dep imported anywhere (even via a stdlib-shadowing name)
+        # counts as used, so compare against ALL imports, not just third-party.
         all_imported_norms = {_normalize(m) for m in all_imports}
 
         for norm_dep, (src_file, lineno) in sorted(declared.items()):

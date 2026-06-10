@@ -12,9 +12,9 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
+import contextlib
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Iterator, Set, List, Tuple, Optional
@@ -147,33 +147,61 @@ def _module_names_for_file(p: Path, root: Path) -> Tuple[str, str]:
 # Import name extraction
 # ---------------------------------------------------------------------------
 
-def _collect_imported_names(tree: ast.AST) -> Set[str]:
+def _collect_imported_names(tree: ast.AST) -> tuple[Set[str], Set[str]]:
     """
-    Collect all module/name base names referenced in import statements.
-    Returns both dotted names and their leaf/base components.
+    Collect module/name references from import statements.
+
+    Returns a pair (dotted_names, bare_names):
+      - dotted_names: every dotted import string with at least one dot
+        (e.g. "pkg.util", "from pkg import util" → "pkg.util" or just "pkg").
+        For ``from pkg import name`` we record "pkg.name" when there's a module
+        part, or the bare name when there isn't.
+      - bare_names: every single-component (no dot) name seen in any import.
+
+    The separation lets the caller apply different matching rules: dotted
+    imports require a suffix match against a module's full dotted path, while
+    bare imports fall back to the generous stem-based match.
     """
-    names: Set[str] = set()
+    dotted_names: Set[str] = set()
+    bare_names: Set[str] = set()
+
+    def _add(name: str) -> None:
+        if "." in name:
+            dotted_names.add(name)
+        else:
+            bare_names.add(name)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 dotted = alias.name
-                names.add(dotted)
-                names.add(dotted.split(".")[0])   # top-level package
-                names.add(dotted.split(".")[-1])  # leaf name
+                _add(dotted)
+                # top-level package (bare)
+                bare_names.add(dotted.split(".")[0])
+                # leaf name (bare)
+                bare_names.add(dotted.split(".")[-1])
+
         elif isinstance(node, ast.ImportFrom):
             module = node.module
             if module:
-                names.add(module)
-                names.add(module.split(".")[0])
-                names.add(module.split(".")[-1])
-            # Also add imported names themselves (e.g. `from pkg import MyClass`)
-            for alias in node.names:
-                if alias.name != "*":
-                    names.add(alias.name)
-            # Relative: `from .x import y` — base name is "x"
+                _add(module)
+                bare_names.add(module.split(".")[0])
+                bare_names.add(module.split(".")[-1])
+                # `from pkg import name` → record "pkg.name" as dotted
+                for alias in node.names:
+                    if alias.name != "*":
+                        dotted_names.add(module + "." + alias.name)
+            else:
+                # `from . import name` (relative, no module) — only bare
+                for alias in node.names:
+                    if alias.name != "*":
+                        bare_names.add(alias.name)
+
+            # Relative: `from .x import y` — base name is "x" (bare)
             if node.level and node.level > 0 and module:
-                names.add(module.split(".")[-1])
-    return names
+                bare_names.add(module.split(".")[-1])
+
+    return dotted_names, bare_names
 
 
 def _has_definitions(tree: ast.AST) -> bool:
@@ -221,15 +249,49 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
         # Still report untested_module findings even when no tests exist,
         # so callers can see what needs coverage.
 
-    # Collect all names referenced by test files
-    referenced_by_tests: Set[str] = set()
+    # Collect all names referenced by test files, split into dotted vs bare.
+    test_dotted: Set[str] = set()   # dotted imports (at least one dot component)
+    test_bare: Set[str] = set()     # bare single-name imports
     for tp in test_files:
-        try:
+        # Unreadable/unparseable test files are skipped by design.
+        with contextlib.suppress(Exception):
             source = tp.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(tp))
-            referenced_by_tests.update(_collect_imported_names(tree))
-        except (SyntaxError, Exception):
-            pass
+            d, b = _collect_imported_names(tree)
+            test_dotted.update(d)
+            test_bare.update(b)
+
+    def _is_tested(dotted: str, stem: str) -> bool:
+        """Return True if any test import covers this module.
+
+        Matching rules
+        --------------
+        1. Full dotted name exact match (dotted imports).
+        2. Suffix match aligned on dot boundaries — e.g. test imports "pkg.util"
+           and module is "src.pkg.util" (dotted imports only).
+        3. Bare stem match — if a test does a bare ``import util`` or uses "util"
+           as a leaf name, it matches any module with that stem (generous, kept
+           for backward-compat with existing bare-import style tests).
+           Bare stem matching uses *test_bare* only, so that a dotted import
+           ``from pkg1 import util`` (recorded as "pkg1.util" in dotted) does
+           NOT bless an unrelated ``pkg2/util.py`` via stem alone.
+        """
+        # Rule 1 & 2: dotted imports require identity or suffix alignment
+        for test_imp in test_dotted:
+            if test_imp == dotted:
+                return True
+            # suffix check: module dotted must end with "."+test_imp or be test_imp
+            if dotted == test_imp or dotted.endswith("." + test_imp):
+                return True
+            # also check if test_imp ends with "."+dotted (test imports a parent)
+            if test_imp.endswith("." + dotted) or test_imp == dotted:
+                return True
+
+        # Rule 3: bare stem match (generous — keeps existing behaviour for bare imports)
+        if stem in test_bare:
+            return True
+
+        return False
 
     # Check each source file
     if "untested_module" not in ignore:
@@ -244,8 +306,7 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
                 continue
 
             dotted, stem = _module_names_for_file(sp, root)
-            # Conservative: if ANY of the names appear in what tests import, skip
-            if dotted in referenced_by_tests or stem in referenced_by_tests:
+            if _is_tested(dotted, stem):
                 continue
 
             lines = source.splitlines()

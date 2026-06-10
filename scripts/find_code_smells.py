@@ -6,7 +6,6 @@ Finds: magic numbers, bare excepts, mutable defaults, type comparisons,
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -27,7 +26,7 @@ class CodeSmell:
 
 
 class CodeSmellDetector(ast.NodeVisitor):
-    MAGIC_NUMBER_WHITELIST = {0, 1, -1, 2, 10, 100, 1000, 24, 60, 365, 0.0, 1.0, 0.5}
+    MAGIC_NUMBER_WHITELIST = frozenset({0, 1, -1, 2, 10, 100, 1000, 24, 60, 365, 0.0, 1.0, 0.5})
 
     def __init__(self, filename: str, source_lines: list[str], ignore: set[str] = None):
         self.filename = filename
