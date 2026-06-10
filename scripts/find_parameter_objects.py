@@ -15,7 +15,6 @@ Finds:
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -98,7 +97,7 @@ def detect(path: Path, ignore: set):
         issues.append(CodeSmell(
             file=f0, line=ln0, smell_type="data_clump",
             description=f"Parameters {names} appear together in {len(locs)} functions: {where}{more}",
-            suggestion=f"Group them into a dataclass (e.g. a single typed object) and pass that instead of the loose parameters.",
+            suggestion="Group them into a dataclass (e.g. a single typed object) and pass that instead of the loose parameters.",
             severity="medium", code_snippet="",
         ))
     issues.sort(key=lambda x: (x.file, x.line))

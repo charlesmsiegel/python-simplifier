@@ -1,6 +1,6 @@
 ---
 name: python-simplifier
-description: Critically review and simplify Python code — aggressively. Use whenever the user wants to simplify, refactor, clean up, make more readable, reduce complexity, improve code quality, find code smells, find bugs from shared mutable state or bad exception handling, detect duplication or data clumps, fix naming, remove dead code or over-engineering, enforce consistent patterns, or audit a Python codebase. Triggers on "simplify this", "this is too complex", "make this cleaner/more readable", "refactor this", "clean this up", "review my code", "find issues", "is this over-engineered", "analyze this codebase", or any review where the goal is simpler, more consistent, more correct Python. Combines deterministic AST detectors (run them) with judgment-based review guides in references/ (load them). Use this even when the user just pastes Python and asks "what do you think?". For Django-specific analysis, use the django-simplifier skill instead.
+description: Critically review and simplify Python code — aggressively. Use whenever the user wants to simplify, refactor, clean up, make more readable, reduce complexity, improve code quality, find code smells, find bugs from shared mutable state or bad exception handling, detect duplication or data clumps, fix naming, remove dead code or over-engineering, enforce consistent patterns, audit a Python codebase, find resource leaks or security risks, break import cycles and god modules, modernize dated idioms, add type annotations, reconcile a dependency manifest, build a test safety net (characterization tests) before refactoring, find weak tests, review AI-generated / vibe-coded code or a change request for hallucinated APIs, stubs, swallowed errors and tests that can't fail, find imports buried in functions, run the repo's own tools (ruff/mypy/black/isort/bandit) when installed, or clean up an entire poorly-written-but-working repository from cold. Triggers on "simplify this", "this is too complex", "make this cleaner/more readable", "refactor this", "clean this up", "review my code", "find issues", "is this over-engineered", "analyze this codebase", or any review where the goal is simpler, more consistent, more correct Python. Combines deterministic AST detectors (run them) with judgment-based review guides in references/ (load them). Use this even when the user just pastes Python and asks "what do you think?". For Django-specific analysis, use the django-simplifier skill instead.
 ---
 
 # Python Code Simplifier
@@ -33,6 +33,13 @@ behavior-preserving steps. The burden of proof is on complexity, not on its remo
   right one applied consistently. **Load the relevant guide** when doing that review.
 
 ## Workflow
+
+**Cleaning up a whole poorly-written repo from cold?** The steps below assume the
+code already runs, has some tests, and is roughly formatted. When it doesn't, follow
+`references/messy-repo-runbook.md` first — get it running, **build a test safety net
+before touching anything** (`references/safety-net-and-testing.md`), normalize
+formatting in one behavior-free commit, *then* return here to triage. Refactoring
+without a net violates rule #1.
 
 1. **Run the analyzer.** `python scripts/analyze_all.py <path>` (add `--format json`
    for tooling). Triage deterministic findings first — don't spend judgment on what a
@@ -85,6 +92,23 @@ python scripts/find_unpythonic.py .            # range(len), == True/None, manua
 python scripts/find_mutation_hazards.py .      # Mutable class attrs, modify-during-iteration, mutated defaults
 python scripts/find_exception_issues.py .      # raise-without-from, unreachable except, BaseException, assert-validation
 python scripts/find_global_state.py .          # Mutated module globals, global-rebinding functions
+python scripts/find_resource_leaks.py .        # open()/socket/tempfile not used as a context manager (fd leaks)
+python scripts/find_security_issues.py .       # eval/exec, shell=True, unsafe yaml/pickle, weak hash, hardcoded secrets
+
+# Architecture & repo structure (cross-file)
+python scripts/find_import_cycles.py .         # Circular imports, god modules, wildcard imports, logic in __init__
+python scripts/find_dependency_issues.py .     # Missing/unused/unpinned third-party deps vs. the manifest
+
+# Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
+python scripts/find_untested_modules.py .      # Source modules no test references; "no tests in repo" alarm
+python scripts/find_test_smells.py .           # Assertion-less/trivial tests, over-mocking, logic in tests, silent skips
+
+# AI-generated-code tells (see references/ai-generated-code.md)
+python scripts/find_ai_scaffolding.py .        # NotImplementedError stubs, pass/... bodies, placeholder values, unused **kwargs
+python scripts/find_duplicate_definitions.py . # Same name defined twice (later silently wins); merge-conflict markers
+python scripts/find_unawaited_coroutines.py .  # async call created and discarded (silent no-op)
+python scripts/find_local_imports.py .         # Imports inside functions / not at top of file (circular-import workarounds)
+python scripts/find_redundant_comments.py .    # Comments that just narrate the next line (NOISY — opt-in, not in analyze_all)
 
 # Design & simplification
 python scripts/find_parameter_objects.py .     # Data clumps: parameter groups recurring across functions
@@ -93,6 +117,10 @@ python scripts/find_return_issues.py .         # Inconsistent returns, if/else-r
 python scripts/find_loop_simplifications.py .  # Loop→comprehension, += string concat, manual any()/all()
 python scripts/find_naming_issues.py .         # Shadowed builtins, non-snake_case funcs, non-PascalCase classes
 python scripts/find_comment_smells.py .        # Commented-out code, TODO/FIXME inventory
+python scripts/find_debug_leftovers.py .       # pdb.set_trace/breakpoint/ipdb, stray debug prints
+python scripts/find_outdated_idioms.py .       # %/format → f-strings, typing.List → list, os.path → pathlib, super(args)
+python scripts/find_missing_docstrings.py .    # Public modules/classes/functions with no docstring
+python scripts/find_type_gaps.py .             # Missing annotations at API boundaries, Any overuse, broad type:ignore
 
 # Format findings as a portable artifact (does NOT create tickets)
 python scripts/format_findings.py report.json                       # markdown list
@@ -104,6 +132,42 @@ All detectors share one interface: `--format text|json`, `--ignore type1,type2`,
 🔴/🟡/🟢 severities. JSON output is a flat list of findings; `analyze_all.py`
 aggregates them. They are deliberately conservative (false negatives over false
 positives) so the output stays trustworthy.
+
+## Use the repo's own tools when they exist
+
+The detectors above are stdlib-only on purpose, but if the target repo's environment
+already has the real tools, they are stronger — so use them. `run_external_tools.py`
+**detects what is installed in the current environment** (ruff, mypy, black, isort,
+bandit, flake8), runs every available one in non-mutating check mode, and merges the
+output into this skill's findings shape:
+
+```bash
+python scripts/run_external_tools.py .                 # run all available (check only)
+python scripts/run_external_tools.py . --format json   # {tools_run, missing_tools, findings}
+python scripts/run_external_tools.py . --fix           # also run black/isort/ruff --fix (MUTATES)
+```
+
+**When a tool is missing, ask before installing.** The script never installs anything;
+it lists each absent tool with a `pip install` hint under `missing_tools`. When that
+list is non-empty and the tools would help the task, **ask the user whether to install
+them** (e.g. via the AskUserQuestion tool) and only install on confirmation — never
+auto-install into someone's environment.
+
+## Reviewing a change request (diff lens)
+
+For an AI-written feature or CR, review *what changed*, not the legacy around it.
+`analyze_diff.py` runs the file-level detectors against only the changed files, and by
+default only the added/modified lines:
+
+```bash
+python scripts/analyze_diff.py                 # working tree vs. merge-base with the default branch
+python scripts/analyze_diff.py origin/main     # vs. an explicit base ref
+python scripts/analyze_diff.py --format json | python scripts/format_findings.py
+```
+
+Whole-repo detectors (import cycles, dependency hygiene, untested modules, duplicate
+code) need the full tree — run those with `analyze_all.py` separately. See
+`references/ai-generated-code.md` for the AI-CR review stance.
 
 ## Reference index (load on demand)
 
@@ -117,6 +181,10 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | Judging names, comments, and function shape; deleting comments that lie | `references/naming-comments-readability.md` |
 | Choosing the right Python pattern AND making the codebase use it consistently | `references/patterns-and-consistency.md` |
 | You want concrete before/after idiom swaps | `references/python-idioms.md` |
+| Cleaning up a whole poorly-written-but-working repo from cold — the phased campaign (run it, net it, normalize, triage, ratchet) | `references/messy-repo-runbook.md` |
+| Building the test safety net before refactoring — coverage maps, characterization & golden-master tests, spotting hollow tests | `references/safety-net-and-testing.md` |
+| Adopting type hints incrementally, modernizing dated idioms, and fixing a dishonest dependency manifest | `references/typing-and-modernization.md` |
+| Reviewing AI-generated code or vibe-coded features/CRs — hallucinated APIs, plausible-but-wrong logic, scaffolding, fake robustness, tests that can't fail | `references/ai-generated-code.md` |
 
 ## Over-engineering anti-patterns (quick reference)
 
@@ -144,6 +212,19 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | if/elif type-switch | Dispatch dict or polymorphism |
 | Magic numbers/strings | Named constants / enums |
 | Commented-out code | Delete it (git remembers) |
+| `f = open(...)` without `with` | Use `with open(...) as f:` (deterministic close) |
+| `eval`/`exec`, `shell=True`, `yaml.load`, hardcoded secret | Remove dynamic eval, pass arg lists, `yaml.safe_load`, load secrets from env |
+| Circular import / god module / `from x import *` | Break the cycle, split by responsibility, import names explicitly |
+| `pdb.set_trace()` / `breakpoint()` / stray `print` | Delete before committing; use logging if needed |
+| `"%s" % x`, `"{}".format(x)`, `typing.List`, `super(C, self)` | f-string, builtin generics / `X \| Y`, bare `super()` |
+| Missing annotation / docstring on public API | Annotate boundaries (adopt mypy), add an intent-revealing docstring |
+| Untested module about to be refactored | Pin behavior with a characterization test first |
+| Import inside a function / not at top | Move to module top; fix the real circular import instead of deferring |
+| `NotImplementedError`/`pass` stub, placeholder value, unused `**kwargs` | Finish it or delete the scaffolding |
+| Same function/class defined twice; `<<<<<<<` markers | Remove the duplicate / resolve the conflict (the later def silently wins) |
+| Coroutine called without `await` | `await` it (or wrap in `asyncio.create_task`/`gather`) |
+| `except Exception: pass` / `print(e)` then continue | Handle and re-raise, or catch a narrow type — don't swallow |
+| Test that asserts nothing or only `assert True`/`assertIsNotNone` | Assert the actual expected value/behavior |
 
 ## When NOT to simplify
 
@@ -158,8 +239,15 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 These scripts complement linters; they don't replace them. Some detectors overlap
 Ruff rule sets — naming (`N`), flake8-builtins (`A`), commented-out code (`ERA`),
 TODOs (`TD`), some return/loop simplifications (`RET`, `SIM`, `PERF`), boolean traps
-(`FBT`). If the repo already runs those Ruff rules, disable the matching detector via
-`--ignore` to avoid double-reporting. The unique value here is the **bug-finding and
-design detectors** (mutation hazards, exception chaining, global state, data clumps,
-coupling, duplication) plus the **judgment guides** — which no linter provides.
+(`FBT`), debug leftovers (`T10`/`T20`), outdated idioms (`UP` pyupgrade), missing
+docstrings (`D`), missing annotations (`ANN`), and security (`S`/bandit). If the repo
+already runs those Ruff rules, disable the matching detector via `--ignore` (or skip
+it in the analyzer) to avoid double-reporting — or better, run the real tools with
+`run_external_tools.py` (above) and lean on the detectors only for what the tools
+don't cover. The unique value here is the **bug-finding and design detectors**
+(mutation hazards, exception chaining, global state, resource leaks, import cycles,
+unawaited coroutines, data clumps, coupling, duplication), the **repo-level checks**
+(dependency hygiene, untested-module and test-smell detection that scaffold a safety
+net), the **AI-code tells** (scaffolding, duplicate definitions, fake robustness),
+plus the **judgment guides** — which no linter provides.
 ```

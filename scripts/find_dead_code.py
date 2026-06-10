@@ -5,7 +5,6 @@ Finds: unused imports, unused variables, unreachable code, unused functions/clas
 """
 
 import ast
-import sys
 import json
 import argparse
 from pathlib import Path
@@ -264,7 +263,8 @@ def main():
             print(f"  {t}: {c}")
         print()
         
-        conf_icon = lambda c: '🔴' if c == 100 else ('🟡' if c >= 80 else '🟢')
+        def conf_icon(c):
+            return '🔴' if c == 100 else ('🟡' if c >= 80 else '🟢')
         
         for issue in all_issues:
             icon = conf_icon(issue.confidence)

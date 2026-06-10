@@ -6,9 +6,9 @@ Finds: YAGNI violations, speculative generality, premature abstraction,
 """
 
 import ast
-import sys
 import json
 import argparse
+import contextlib
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Iterator
@@ -38,13 +38,12 @@ class ProjectAnalyzer:
         self.issues: list[OverEngineeringIssue] = []
 
     def analyze_file(self, filepath: Path):
-        try:
+        # Unreadable/unparseable files are skipped by design.
+        with contextlib.suppress(Exception):
             source = filepath.read_text(encoding='utf-8', errors='replace')
             tree = ast.parse(source, filename=str(filepath))
             visitor = ClassCollector(str(filepath), source.splitlines(), self)
             visitor.visit(tree)
-        except (SyntaxError, Exception):
-            pass
 
     def detect_issues(self):
         # Single-implementation abstract classes

@@ -14,7 +14,6 @@ self-contained.)
 
 import ast
 import io
-import sys
 import json
 import tokenize
 import argparse

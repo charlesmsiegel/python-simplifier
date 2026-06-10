@@ -3,13 +3,13 @@
 Comprehensive Python code analyzer - runs all checks and produces unified report.
 """
 
+import io
 import sys
 import json
 import argparse
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
 
 
 def run_analyzer(script_name: str, path: str) -> dict:
@@ -80,6 +80,48 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
     print("🔍 Finding comment smells...", file=sys.stderr)
     results['comment_smells'] = run_analyzer('find_comment_smells.py', path)
 
+    print("🔍 Finding resource leaks...", file=sys.stderr)
+    results['resource_leaks'] = run_analyzer('find_resource_leaks.py', path)
+
+    print("🔍 Finding security issues...", file=sys.stderr)
+    results['security'] = run_analyzer('find_security_issues.py', path)
+
+    print("🔍 Finding import cycles / god modules...", file=sys.stderr)
+    results['import_cycles'] = run_analyzer('find_import_cycles.py', path)
+
+    print("🔍 Finding debug leftovers...", file=sys.stderr)
+    results['debug_leftovers'] = run_analyzer('find_debug_leftovers.py', path)
+
+    print("🔍 Finding outdated idioms...", file=sys.stderr)
+    results['outdated_idioms'] = run_analyzer('find_outdated_idioms.py', path)
+
+    print("🔍 Finding missing docstrings...", file=sys.stderr)
+    results['missing_docstrings'] = run_analyzer('find_missing_docstrings.py', path)
+
+    print("🔍 Finding type-annotation gaps...", file=sys.stderr)
+    results['type_gaps'] = run_analyzer('find_type_gaps.py', path)
+
+    print("🔍 Checking dependency hygiene...", file=sys.stderr)
+    results['dependency_issues'] = run_analyzer('find_dependency_issues.py', path)
+
+    print("🔍 Finding untested modules...", file=sys.stderr)
+    results['untested_modules'] = run_analyzer('find_untested_modules.py', path)
+
+    print("🔍 Finding test smells...", file=sys.stderr)
+    results['test_smells'] = run_analyzer('find_test_smells.py', path)
+
+    print("🔍 Finding AI scaffolding/placeholders...", file=sys.stderr)
+    results['ai_scaffolding'] = run_analyzer('find_ai_scaffolding.py', path)
+
+    print("🔍 Finding duplicate definitions / merge artifacts...", file=sys.stderr)
+    results['duplicate_definitions'] = run_analyzer('find_duplicate_definitions.py', path)
+
+    print("🔍 Finding unawaited coroutines...", file=sys.stderr)
+    results['unawaited_coroutines'] = run_analyzer('find_unawaited_coroutines.py', path)
+
+    print("🔍 Finding non-top-level imports...", file=sys.stderr)
+    results['local_imports'] = run_analyzer('find_local_imports.py', path)
+
     if not skip_duplicates:
         print("🔍 Finding duplicates...", file=sys.stderr)
         results['duplicates'] = run_analyzer('find_duplicates.py', path)
@@ -88,7 +130,10 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
         'meta': {
             'analyzed_path': path,
             'timestamp': datetime.now().isoformat(),
-            'analyzers_run': list(results.keys())
+            'analyzers_run': list(results.keys()),
+            # category -> error string for every analyzer that did not complete.
+            # A zero count for one of these categories means "unknown", not "clean".
+            'analyzer_errors': {}
         },
         'summary': {
             'total_issues': 0,
@@ -105,6 +150,8 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
         elif isinstance(data, dict):
             if 'issues' in data:
                 issues = data['issues']
+            if data.get('error'):
+                report['meta']['analyzer_errors'][category] = str(data['error'])
 
         normalized = []
         for issue in issues:
@@ -159,8 +206,19 @@ def print_text_report(report: dict):
             print(f"  {cat}: {count}")
     print()
 
+    analyzer_errors = meta.get('analyzer_errors') or {}
+    if analyzer_errors:
+        print("⚠️  ANALYSIS INCOMPLETE — these analyzers did not finish; their")
+        print("    categories show what was found before failure, not a clean bill:")
+        for cat, err in sorted(analyzer_errors.items()):
+            print(f"    • {cat}: {err}")
+        print()
+
     if summary['total_issues'] == 0:
-        print("✅ No issues found! Your code looks great!")
+        if analyzer_errors:
+            print("No issues found by the analyzers that completed (see warnings above).")
+        else:
+            print("✅ No issues found! Your code looks great!")
         return
 
     print("=" * 70)
@@ -224,6 +282,34 @@ def print_text_report(report: dict):
         recommendations.append("• Fix names - stop shadowing builtins, follow snake_case/PascalCase")
     if summary['by_category'].get('comment_smells', 0) > 0:
         recommendations.append("• Delete commented-out code; move TODOs into the tracker")
+    if summary['by_category'].get('resource_leaks', 0) > 0:
+        recommendations.append("• Wrap file/socket handles in 'with' so they close deterministically")
+    if summary['by_category'].get('security', 0) > 0:
+        recommendations.append("• Address security risks - eval/exec, shell=True, unsafe yaml/pickle, hardcoded secrets")
+    if summary['by_category'].get('import_cycles', 0) > 0:
+        recommendations.append("• Break import cycles and split god modules; thin out __init__.py")
+    if summary['by_category'].get('untested_modules', 0) > 0:
+        recommendations.append("• Build the safety net first - characterize untested modules before refactoring")
+    if summary['by_category'].get('test_smells', 0) > 0:
+        recommendations.append("• Fix hollow tests - add assertions, cut over-mocking, remove logic from tests")
+    if summary['by_category'].get('dependency_issues', 0) > 0:
+        recommendations.append("• Reconcile dependencies - declare missing, drop unused, pin versions")
+    if summary['by_category'].get('debug_leftovers', 0) > 0:
+        recommendations.append("• Remove debugger calls and stray prints left in the source")
+    if summary['by_category'].get('outdated_idioms', 0) > 0:
+        recommendations.append("• Modernize idioms - f-strings, builtin generics, pathlib, bare super()")
+    if summary['by_category'].get('type_gaps', 0) > 0:
+        recommendations.append("• Add type annotations at API boundaries; adopt mypy/pyright incrementally")
+    if summary['by_category'].get('missing_docstrings', 0) > 0:
+        recommendations.append("• Document the public API surface with intent-revealing docstrings")
+    if summary['by_category'].get('ai_scaffolding', 0) > 0:
+        recommendations.append("• Finish or remove AI scaffolding - stubs, placeholders, unused **kwargs")
+    if summary['by_category'].get('duplicate_definitions', 0) > 0:
+        recommendations.append("• Resolve duplicate definitions / merge-conflict markers (a later def silently wins)")
+    if summary['by_category'].get('unawaited_coroutines', 0) > 0:
+        recommendations.append("• Await coroutines - an un-awaited async call silently does nothing")
+    if summary['by_category'].get('local_imports', 0) > 0:
+        recommendations.append("• Move imports to module top; fix the circular import instead of deferring it")
 
     if not recommendations:
         recommendations.append("• Your code is in good shape! Consider minor improvements.")
@@ -254,6 +340,20 @@ Runs all analysis checks:
   - Loop simplifications (comprehensions, any/all, join)
   - Naming issues (shadowed builtins, casing)
   - Comment smells (commented-out code, TODOs)
+  - Resource leaks (open/socket without a context manager)
+  - Security issues (eval/exec, shell=True, unsafe yaml/pickle, secrets)
+  - Import cycles & god modules (circular imports, wildcard imports)
+  - Debug leftovers (pdb/breakpoint/stray prints)
+  - Outdated idioms (%/format, old typing, os.path, super(args))
+  - Missing docstrings (public API surface)
+  - Type-annotation gaps (missing annotations, Any, broad type:ignore)
+  - Dependency hygiene (missing/unused/unpinned deps)
+  - Untested modules (safety-net gaps before refactoring)
+  - Test smells (assertion-less/trivial tests, over-mocking, logic in tests)
+  - AI scaffolding (stubs, placeholders, unused **kwargs)
+  - Duplicate definitions & merge-conflict markers
+  - Unawaited coroutines (silent async no-ops)
+  - Non-top-level imports (deferred/circular-workaround imports)
   - Duplicate code (AST-based similarity)
 
 Examples:
@@ -273,7 +373,6 @@ Examples:
     if args.format == 'json':
         output = json.dumps(report, indent=2)
     else:
-        import io
         old_stdout = sys.stdout
         sys.stdout = io.StringIO()
         print_text_report(report)
