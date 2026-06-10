@@ -47,6 +47,9 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
     print("🔍 Finding classic design smells...", file=sys.stderr)
     results['design_smells'] = run_analyzer('find_design_smells.py', path)
 
+    print("🔍 Finding design-pattern issues...", file=sys.stderr)
+    results['pattern_issues'] = run_analyzer('find_pattern_issues.py', path)
+
     print("🔍 Finding dead code...", file=sys.stderr)
     results['dead_code'] = run_analyzer('find_dead_code.py', path)
 
@@ -263,6 +266,8 @@ def print_text_report(report: dict):
         recommendations.append("• Simplify architecture - remove unused abstractions (YAGNI)")
     if summary['by_category'].get('design_smells', 0) > 0:
         recommendations.append("• Apply the classic refactorings - dispatch over type-switches, untangle intimate classes (see references/refactoring-techniques.md)")
+    if summary['by_category'].get('pattern_issues', 0) > 0:
+        recommendations.append("• Right-size design patterns - replace hand-rolled singletons/builders/iterators with Python-native forms; type string state machines (see references/design-patterns.md)")
     if summary['by_category'].get('dead_code', 0) > 5:
         recommendations.append("• Clean up dead code - remove unused imports and functions")
     if summary['by_category'].get('duplicates', 0) > 0:
@@ -334,6 +339,7 @@ Runs all analysis checks:
   - Code smells (mutable defaults, bare excepts, etc.)
   - Over-engineering (unused abstractions, YAGNI)
   - Design smells from the classic catalog (type-switches, refused bequest, intimacy)
+  - Design-pattern issues (hand-rolled singletons/builders/iterators, string state machines)
   - Dead code (unused imports, functions)
   - Unpythonic patterns (range(len), == True)
   - Coupling/cohesion (feature envy, message chains)

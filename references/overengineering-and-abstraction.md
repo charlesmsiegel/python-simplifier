@@ -37,6 +37,11 @@ strategy, wrapper, mixin, decorator, and layer, ask:
 
 ## Specific patterns to hunt
 
+(For the design-pattern-shaped cases — hand-rolled singletons, builders that are
+keyword arguments in disguise, strategy-class hierarchies that are functions in
+costume — see the pattern→simpler map in `design-patterns.md` and run
+`find_pattern_issues.py`.)
+
 **Single-implementation interface / ABC / Protocol.** An abstract base with exactly
 one concrete subclass is a future-proofing tax. Merge them. (Tests are not a second
 implementation — a mock does not justify an interface; patch the concrete class or

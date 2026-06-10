@@ -244,6 +244,114 @@ CASES = [
         },
         {"refused_bequest", "temporary_field", "lazy_class"},
     ),
+    (
+        "find_pattern_issues.py",
+        {
+            "sample.py": (
+                "_CACHE = {}\n"
+                "\n"
+                "def slow(x):\n"
+                "    if x in _CACHE:\n"
+                "        return _CACHE[x]\n"
+                "    _CACHE[x] = x * 2\n"
+                "    return _CACHE[x]\n"
+                "\n"
+                "class Config:\n"
+                "    _instance = None\n"
+                "    def __new__(cls):\n"
+                "        if cls._instance is None:\n"
+                "            cls._instance = super().__new__(cls)\n"
+                "        return cls._instance\n"
+                "\n"
+                "class Borg:\n"
+                "    _shared = {}\n"
+                "    def __init__(self):\n"
+                "        self.__dict__ = self._shared\n"
+                "\n"
+                "class RegistryMeta(type):\n"
+                "    REGISTRY = {}\n"
+                "    def __new__(mcs, name, bases, ns):\n"
+                "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+                "        mcs.REGISTRY[name] = new_cls\n"
+                "        return new_cls\n"
+                "\n"
+                "class Person:\n"
+                "    def get_name(self):\n"
+                "        return self._name\n"
+                "    def set_name(self, value):\n"
+                "        self._name = value\n"
+                "    @property\n"
+                "    def conn(self):\n"
+                "        if self._conn is None:\n"
+                "            self._conn = object()\n"
+                "        return self._conn\n"
+            )
+        },
+        {"handrolled_memoize", "handrolled_singleton", "borg_shared_state",
+         "registry_metaclass", "getter_setter_pair", "handrolled_lazy_property"},
+    ),
+    (
+        "find_pattern_issues.py",
+        {
+            "sample.py": (
+                "class CountUp:\n"
+                "    def __iter__(self):\n"
+                "        return self\n"
+                "    def __next__(self):\n"
+                "        self.i += 1\n"
+                "        return self.i\n"
+                "\n"
+                "class QueryBuilder:\n"
+                "    def set_table(self, t):\n"
+                "        self.table = t\n"
+                "        return self\n"
+                "    def set_cols(self, c):\n"
+                "        self.cols = c\n"
+                "        return self\n"
+                "    def set_limit(self, n):\n"
+                "        self.limit = n\n"
+                "        return self\n"
+                "    def build(self):\n"
+                "        return (self.table, self.cols, self.limit)\n"
+                "\n"
+                "class Conn:\n"
+                "    def __del__(self):\n"
+                "        self.sock.close()\n"
+                "\n"
+                "class Order:\n"
+                "    def pay(self):\n"
+                "        if self.status == 'new':\n"
+                "            self.status = 'paid'\n"
+                "    def ship(self):\n"
+                "        if self.status == 'paid':\n"
+                "            self.status = 'shipped'\n"
+                "    def cancel(self):\n"
+                "        if self.status == 'shipped':\n"
+                "            raise ValueError\n"
+                "        self.status = 'cancelled'\n"
+                "\n"
+                "class Discount:\n"
+                "    def apply(self, order):\n"
+                "        raise NotImplementedError\n"
+                "\n"
+                "class TenPercent(Discount):\n"
+                "    def apply(self, order):\n"
+                "        return order * 0.9\n"
+                "\n"
+                "class OnSale(Discount):\n"
+                "    def apply(self, order):\n"
+                "        return order * 0.5\n"
+                "\n"
+                "def read(f):\n"
+                "    try:\n"
+                "        return f.read()\n"
+                "    finally:\n"
+                "        f.close()\n"
+            )
+        },
+        {"iterator_class", "fluent_builder", "finalizer_del",
+         "string_state_machine", "stateless_strategy_classes", "try_finally_close"},
+    ),
 ]
 
 
@@ -284,6 +392,7 @@ QUIET_ON_CLEAN = [
     "find_type_gaps.py",
     "find_test_smells.py",
     "find_design_smells.py",
+    "find_pattern_issues.py",
 ]
 
 
@@ -751,3 +860,59 @@ def test_analyze_diff_surfaces_detector_failures(tmp_path):
     assert result.returncode == 0, result.stderr[:500]
     errors = [f for f in json.loads(result.stdout) if f["smell_type"] == "detector_error"]
     assert errors and "find_type_gaps.py" in errors[0]["description"]
+
+
+def test_working_metaclass_is_not_a_registry(tmp_path):
+    # EnumType-style metaclasses subscript-assign while building the class;
+    # only storing the *new class itself* into a mapping is registration.
+    (tmp_path / "sample.py").write_text(
+        "class WorkingMeta(type):\n"
+        "    def __new__(mcs, name, bases, ns):\n"
+        "        ns['_value_map'] = {}\n"
+        "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+        "        new_cls._value_map['x'] = 1\n"
+        "        return new_cls\n"
+    )
+    assert "registry_metaclass" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_self_release_in_finally_is_not_flagged(tmp_path):
+    # logging.Handler-style self.acquire()/self.release() is internal lifecycle
+    # management, not a drop-in `with` candidate.
+    (tmp_path / "sample.py").write_text(
+        "class Handler:\n"
+        "    def emit(self):\n"
+        "        self.acquire()\n"
+        "        try:\n"
+        "            self.write()\n"
+        "        finally:\n"
+        "            self.release()\n"
+    )
+    assert "try_finally_close" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_stateful_strategy_classes_are_not_flagged(tmp_path):
+    # Strategies that carry configuration earn their classes.
+    (tmp_path / "sample.py").write_text(
+        "class Discount:\n"
+        "    def apply(self, order):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class Percent(Discount):\n"
+        "    def __init__(self, rate):\n"
+        "        self.rate = rate\n"
+        "\n"
+        "    def apply(self, order):\n"
+        "        return order * self.rate\n"
+        "\n"
+        "class OnSale(Discount):\n"
+        "    def apply(self, order):\n"
+        "        return order * 0.5\n"
+    )
+    assert "stateless_strategy_classes" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )

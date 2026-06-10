@@ -8,6 +8,10 @@ everywhere beats a patchwork of locally clever ones.
 
 ## Part 1 — Choose the right pattern
 
+This section covers the everyday Python idiom choices. For the classic design
+patterns — when a GoF pattern is genuinely warranted, when it's ceremony, and the
+Python-native form of each — load `design-patterns.md`.
+
 **Guard clauses over nested conditionals.** Handle the edge cases up front and
 return early; don't wrap the happy path in three levels of `if`. Flat reads better
 than nested. (`analyze_complexity.py` flags the nesting.)
