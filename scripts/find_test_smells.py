@@ -233,6 +233,144 @@ def _is_skip_decorator(dec: ast.expr) -> tuple[bool, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Trivial-assertion detection helpers
+# ---------------------------------------------------------------------------
+
+def _is_truthy_constant(node: ast.expr) -> bool:
+    """Return True if node is a Constant that is truthy (True, non-zero number, non-empty string)."""
+    if not isinstance(node, ast.Constant):
+        return False
+    return bool(node.value)
+
+
+def _is_falsy_constant(node: ast.expr) -> bool:
+    """Return True if node is a Constant that is falsy (False, 0, empty string, None)."""
+    if not isinstance(node, ast.Constant):
+        return False
+    return not bool(node.value)
+
+
+def _same_structure(a: ast.expr, b: ast.expr) -> bool:
+    """Return True if two AST expression nodes are structurally identical."""
+    return ast.dump(a) == ast.dump(b)
+
+
+def _is_trivial_assertion(node: ast.stmt) -> bool:
+    """
+    Return True if *node* is a trivially vacuous assertion.
+
+    Trivial cases:
+      1. assert <truthy-constant>          e.g. assert True, assert 1, assert "ok"
+      2. self.assertTrue(True)             — assertTrue called with a truthy constant
+      3. self.assertFalse(False)           — assertFalse called with a falsy constant
+      4. assertEqual(x, x) / assert a==a  — both sides structurally identical
+      5. assertIsNotNone(x) / assert x is not None  — not-None alone
+    """
+    # ---- ast.Assert nodes ----
+    if isinstance(node, ast.Assert):
+        test = node.test
+        # Case 1: assert <truthy constant>
+        if _is_truthy_constant(test):
+            return True
+        # Case 4: assert a == a  (Compare with a single Eq op, same operands)
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and _same_structure(test.left, test.comparators[0])
+        ):
+            return True
+        # Case 5: assert x is not None
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.IsNot)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None
+        ):
+            return True
+        return False
+
+    # ---- Expr(Call(...)) — assert* method calls ----
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return False
+    call = node.value
+    func = call.func
+
+    # Resolve method name; only handle self.assertXxx style
+    if not isinstance(func, ast.Attribute):
+        return False
+    method = func.attr
+    args = call.args
+
+    # Case 2: self.assertTrue(True)
+    if method == "assertTrue" and len(args) >= 1 and _is_truthy_constant(args[0]):
+        return True
+
+    # Case 3: self.assertFalse(False)
+    if method == "assertFalse" and len(args) >= 1 and _is_falsy_constant(args[0]):
+        return True
+
+    # Case 4: self.assertEqual(x, x)
+    if method == "assertEqual" and len(args) >= 2 and _same_structure(args[0], args[1]):
+        return True
+
+    # Case 5: self.assertIsNotNone(x)  — not-None check alone
+    if method == "assertIsNotNone":
+        return True
+
+    return False
+
+
+def _collect_assertions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    """
+    Return a flat list of every statement that is an assertion (ast.Assert or
+    an assert* call expression) within the function body, without descending
+    into nested function/class definitions.
+    """
+    results: list[ast.stmt] = []
+
+    def _walk_stmts(stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # don't cross scope boundaries
+            if isinstance(stmt, ast.Assert):
+                results.append(stmt)
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                if _is_assert_call(stmt.value):
+                    results.append(stmt)
+            elif _is_pytest_raises_with(stmt):
+                results.append(stmt)
+            # Recurse into compound-statement children
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, ast.stmt):
+                    _walk_stmts([child])
+
+    _walk_stmts(func_node.body)
+    return results
+
+
+def _all_assertions_trivial(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """
+    Return True iff the function has at least one assertion AND every assertion
+    in it is trivial per _is_trivial_assertion.
+
+    pytest.raises/warns `with` blocks are treated as meaningful (non-trivial).
+    """
+    assertions = _collect_assertions(func_node)
+    if not assertions:
+        return False
+    for stmt in assertions:
+        if _is_pytest_raises_with(stmt):
+            return False  # meaningful — tests that an exception is raised
+        if not _is_trivial_assertion(stmt):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Logic-in-test detection
 # ---------------------------------------------------------------------------
 
@@ -351,6 +489,20 @@ def analyze_file(filepath: Path, ignore: set) -> list[CodeSmell]:
                 ),
                 "low",
                 _get_line(lines, logic_line),
+            )
+
+        # ---- trivial_assertion ---------------------------------------------
+        if _has_assertion(fn) and _all_assertions_trivial(fn):
+            add(
+                fn.lineno,
+                "trivial_assertion",
+                f"Test function '{fn.name}' contains only trivial (vacuous) assertions",
+                (
+                    "Assert the actual expected value or behaviour — "
+                    "an assertion that can never fail protects nothing."
+                ),
+                "medium",
+                fn_snippet,
             )
 
     return issues

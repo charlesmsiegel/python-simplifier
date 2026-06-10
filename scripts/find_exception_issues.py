@@ -207,6 +207,78 @@ class ExceptionIssueDetector(ast.NodeVisitor):
                     catch_all_label = nm
         self.generic_visit(node)
 
+    # -- helpers for swallowed_exception ----------------------------------
+    @staticmethod
+    def _is_broad_catch(handler: ast.ExceptHandler) -> bool:
+        """True for bare except:, except Exception:, or except BaseException:."""
+        if handler.type is None:
+            return True
+        if isinstance(handler.type, ast.Name):
+            return handler.type.id in {"Exception", "BaseException"}
+        return False
+
+    @staticmethod
+    def _body_has_raise(body) -> bool:
+        """True if any node in the handler body (same scope) is a Raise."""
+        for n in _same_scope_nodes(body, stop_types=(ast.ExceptHandler,)):
+            if isinstance(n, ast.Raise):
+                return True
+        return False
+
+    _LOG_ATTRS = {"warning", "warn", "error", "exception", "critical", "fatal"}
+
+    @staticmethod
+    def _body_has_log_call(body) -> bool:
+        """True if the body contains a call whose attribute name looks like warn/error/etc."""
+        for n in _same_scope_nodes(body, stop_types=(ast.ExceptHandler,)):
+            if (isinstance(n, ast.Expr)
+                    and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Attribute)
+                    and n.value.func.attr in ExceptionIssueDetector._LOG_ATTRS):
+                return True
+        return False
+
+    @staticmethod
+    def _is_silent_body(body) -> bool:
+        """True when the body is one of the recognized silent shapes:
+          - only `pass`
+          - only a single return / return None / continue / break
+          - only a bare print(...) optionally followed by one control-flow stmt
+        """
+        stmts = [s for s in body if not isinstance(s, ast.Pass)]
+        # pure pass (or empty)
+        if len(stmts) == 0:
+            return True
+
+        _ctrl = (ast.Return, ast.Continue, ast.Break)
+
+        def _is_ctrl(s):
+            if isinstance(s, ast.Return):
+                return s.value is None or (
+                    isinstance(s.value, ast.Constant) and s.value.value is None
+                )
+            return isinstance(s, (ast.Continue, ast.Break))
+
+        # single control-flow statement
+        if len(stmts) == 1 and _is_ctrl(stmts[0]):
+            return True
+
+        # single bare print(...)
+        def _is_bare_print(s):
+            return (
+                isinstance(s, ast.Expr)
+                and isinstance(s.value, ast.Call)
+                and isinstance(s.value.func, ast.Name)
+                and s.value.func.id == "print"
+            )
+
+        if len(stmts) == 1 and _is_bare_print(stmts[0]):
+            return True
+        if len(stmts) == 2 and _is_bare_print(stmts[0]) and _is_ctrl(stmts[1]):
+            return True
+
+        return False
+
     # -- BaseException + raise-without-from (per handler) -----------------
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         names, _ = _handler_type_names(node)
@@ -225,6 +297,29 @@ class ExceptionIssueDetector(ast.NodeVisitor):
                     self._add(getattr(n, "lineno", node.lineno), "raise_without_from",
                         "Raising a different exception inside 'except' without 'from' discards the original cause",
                         "Use 'raise ... from err' to chain the original exception, or 'from None' to suppress it.")
+
+        # ---------------------------------------------------------------- #
+        # swallowed_exception — a catch that silently discards the error.
+        # This is the single owner of swallow detection (broad and narrow).
+        # ---------------------------------------------------------------- #
+        if (not self._body_has_raise(node.body)
+                and not self._body_has_log_call(node.body)
+                and self._is_silent_body(node.body)):
+            if self._is_broad_catch(node):
+                catch_label = "bare except" if node.type is None else f"except {node.type.id}"
+                self._add(node.lineno, "swallowed_exception",
+                    f"Broad '{catch_label}:' silently discards the exception without logging or re-raising",
+                    "Don't silently swallow — log with context and re-raise, "
+                    "or catch a narrow exception type you can actually handle.",
+                    "medium")
+            elif all(isinstance(s, ast.Pass) for s in node.body):
+                # narrow `except X: pass` — less dangerous, but still a silent ignore
+                self._add(node.lineno, "swallowed_exception",
+                    f"'except {' / '.join(names)}:' silently ignores the exception",
+                    "If ignoring is intentional, say so explicitly with "
+                    "contextlib.suppress(...) and a comment; otherwise log or handle it.",
+                    "low")
+
         self.generic_visit(node)
 
     # -- assert used for validation ---------------------------------------

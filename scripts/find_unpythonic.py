@@ -107,22 +107,9 @@ class UnpythonicDetector(ast.NodeVisitor):
         
         self.generic_visit(node)
 
-    def visit_Try(self, node: ast.Try):
-        for handler in node.handlers:
-            if len(handler.body) == 1 and isinstance(handler.body[0], ast.Pass):
-                if handler.type is None:
-                    self._add(handler.lineno, "swallowed_exception",
-                        "Bare except with pass swallows all exceptions",
-                        "except: pass",
-                        "except SpecificError: handle_or_log()",
-                        "high")
-                else:
-                    self._add(handler.lineno, "silent_exception",
-                        "Exception caught but silently ignored",
-                        "except Error: pass",
-                        "except Error: logger.debug(...) or raise",
-                        "medium")
-        self.generic_visit(node)
+    # Exception-swallowing (bare/narrow `except: pass`) is detected by
+    # find_exception_issues.py (swallowed_exception) — the dedicated owner —
+    # so it is intentionally not duplicated here.
 
     def visit_Assign(self, node: ast.Assign):
         if len(node.targets) == 1:

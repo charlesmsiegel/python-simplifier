@@ -200,7 +200,7 @@ def _collect_imports(root: Path) -> dict[str, list[str]]:
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(filepath))
-        except Exception:
+        except (SyntaxError, Exception):
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

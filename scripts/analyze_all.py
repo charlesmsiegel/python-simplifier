@@ -3,6 +3,7 @@
 Comprehensive Python code analyzer - runs all checks and produces unified report.
 """
 
+import io
 import sys
 import json
 import argparse
@@ -109,6 +110,18 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
 
     print("🔍 Finding test smells...", file=sys.stderr)
     results['test_smells'] = run_analyzer('find_test_smells.py', path)
+
+    print("🔍 Finding AI scaffolding/placeholders...", file=sys.stderr)
+    results['ai_scaffolding'] = run_analyzer('find_ai_scaffolding.py', path)
+
+    print("🔍 Finding duplicate definitions / merge artifacts...", file=sys.stderr)
+    results['duplicate_definitions'] = run_analyzer('find_duplicate_definitions.py', path)
+
+    print("🔍 Finding unawaited coroutines...", file=sys.stderr)
+    results['unawaited_coroutines'] = run_analyzer('find_unawaited_coroutines.py', path)
+
+    print("🔍 Finding non-top-level imports...", file=sys.stderr)
+    results['local_imports'] = run_analyzer('find_local_imports.py', path)
 
     if not skip_duplicates:
         print("🔍 Finding duplicates...", file=sys.stderr)
@@ -274,6 +287,14 @@ def print_text_report(report: dict):
         recommendations.append("• Add type annotations at API boundaries; adopt mypy/pyright incrementally")
     if summary['by_category'].get('missing_docstrings', 0) > 0:
         recommendations.append("• Document the public API surface with intent-revealing docstrings")
+    if summary['by_category'].get('ai_scaffolding', 0) > 0:
+        recommendations.append("• Finish or remove AI scaffolding - stubs, placeholders, unused **kwargs")
+    if summary['by_category'].get('duplicate_definitions', 0) > 0:
+        recommendations.append("• Resolve duplicate definitions / merge-conflict markers (a later def silently wins)")
+    if summary['by_category'].get('unawaited_coroutines', 0) > 0:
+        recommendations.append("• Await coroutines - an un-awaited async call silently does nothing")
+    if summary['by_category'].get('local_imports', 0) > 0:
+        recommendations.append("• Move imports to module top; fix the circular import instead of deferring it")
 
     if not recommendations:
         recommendations.append("• Your code is in good shape! Consider minor improvements.")
@@ -313,7 +334,11 @@ Runs all analysis checks:
   - Type-annotation gaps (missing annotations, Any, broad type:ignore)
   - Dependency hygiene (missing/unused/unpinned deps)
   - Untested modules (safety-net gaps before refactoring)
-  - Test smells (assertion-less tests, over-mocking, logic in tests)
+  - Test smells (assertion-less/trivial tests, over-mocking, logic in tests)
+  - AI scaffolding (stubs, placeholders, unused **kwargs)
+  - Duplicate definitions & merge-conflict markers
+  - Unawaited coroutines (silent async no-ops)
+  - Non-top-level imports (deferred/circular-workaround imports)
   - Duplicate code (AST-based similarity)
 
 Examples:
@@ -333,7 +358,6 @@ Examples:
     if args.format == 'json':
         output = json.dumps(report, indent=2)
     else:
-        import io
         old_stdout = sys.stdout
         sys.stdout = io.StringIO()
         print_text_report(report)

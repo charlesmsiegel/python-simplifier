@@ -14,6 +14,10 @@ Finds:
   - tls_verify_disabled    : call with verify=False, or ssl._create_unverified_context
   - hardcoded_secret       : assignment of a string literal to a name that looks
                              like a credential/secret
+  - sql_injection          : DB execute/executemany/etc. called with a dynamically
+                             built SQL string (f-string, %-format, +concat, .format)
+  - command_injection      : subprocess/os.system/os.popen called with a dynamically
+                             built command string (shell=True makes it worse)
 """
 
 import ast
@@ -93,6 +97,43 @@ def _target_looks_like_secret(node) -> bool:
     return False
 
 
+def _is_dynamic_string(node) -> bool:
+    """Return True if `node` is a string that is built dynamically at runtime.
+
+    Covers:
+      - f-strings (ast.JoinedStr with at least one FormattedValue)
+      - %-format BinOp whose left side is a str Constant (or whose operator is Mod)
+      - +-concatenation BinOp that involves a str Constant on either side
+      - .format() call on a str literal or an arbitrary expression
+    """
+    if isinstance(node, ast.JoinedStr):
+        return any(isinstance(v, ast.FormattedValue) for v in node.values)
+
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Mod):
+            # "..." % x  or  x % "..."  — treat left-str case as SQL-like interpolation
+            return (isinstance(node.left, ast.Constant)
+                    and isinstance(node.left.value, str))
+        if isinstance(node.op, ast.Add):
+            return (
+                (isinstance(node.left, ast.Constant) and isinstance(node.left.value, str))
+                or (isinstance(node.right, ast.Constant) and isinstance(node.right.value, str))
+            )
+
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "format":
+            # "...".format(x)  or  expr.format(x)
+            return True
+
+    return False
+
+
+_SQL_EXECUTE_ATTRS = {"execute", "executemany", "executescript", "raw", "mogrify"}
+
+_SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
+
+
 def detect(tree, filename, lines, ignore):
     issues = []
 
@@ -114,6 +155,51 @@ def detect(tree, filename, lines, ignore):
                     f"Call to builtin '{func.id}()' executes arbitrary Python code",
                     "Avoid dynamic code execution. Use ast.literal_eval() for safe literal "
                     "parsing, or replace with explicit dispatch logic.",
+                    "high")
+
+            # ---------------------------------------------------------------- #
+            # sql_injection — execute/executemany/etc. with dynamic SQL string
+            # ---------------------------------------------------------------- #
+            elif (isinstance(func, ast.Attribute)
+                  and func.attr in _SQL_EXECUTE_ATTRS
+                  and node.args
+                  and _is_dynamic_string(node.args[0])):
+                add(node.lineno, "sql_injection",
+                    f"Call to .{func.attr}() passes a dynamically built SQL string",
+                    "Use parameterized queries — pass parameters as the second argument "
+                    "(e.g. execute(sql, params)); never interpolate values into SQL.",
+                    "high")
+
+            # ---------------------------------------------------------------- #
+            # command_injection — subprocess/os.* with a dynamic command string
+            # ---------------------------------------------------------------- #
+            elif (isinstance(func, ast.Attribute)
+                  and func.attr in ("system", "popen")
+                  and isinstance(func.value, ast.Name)
+                  and func.value.id == "os"
+                  and node.args
+                  and _is_dynamic_string(node.args[0])):
+                add(node.lineno, "command_injection",
+                    f"os.{func.attr}() is called with a dynamically built command string",
+                    "Pass an argument list (e.g. [\"ls\", d]) and avoid shell=True; "
+                    "never interpolate values into a shell string.",
+                    "high")
+
+            elif (isinstance(func, ast.Attribute)
+                  and isinstance(func.value, ast.Name)
+                  and func.value.id == "subprocess"
+                  and func.attr in _SUBPROCESS_FUNCS
+                  and node.args
+                  and _is_dynamic_string(node.args[0])):
+                has_shell = (
+                    _keyword_value(node, "shell") is not None
+                    and not _is_false_literal(_keyword_value(node, "shell"))
+                )
+                detail = " (shell=True makes this worse)" if has_shell else ""
+                add(node.lineno, "command_injection",
+                    f"subprocess.{func.attr}() is called with a dynamically built command string{detail}",
+                    "Pass an argument list (e.g. [\"ls\", d]) and avoid shell=True; "
+                    "never interpolate values into a shell string.",
                     "high")
 
             # ---------------------------------------------------------------- #

@@ -50,6 +50,9 @@ the way first, in commits that change **zero behavior**:
 - **Format and sort imports** repo-wide in a single commit: `ruff format` (or
   Black) + `ruff check --select I --fix`. One giant whitespace commit that touches
   everything, then never again — so subsequent diffs are pure intent.
+  `scripts/run_external_tools.py --fix` runs the installed formatters (black, isort,
+  ruff --fix) for you; if they aren't installed, it tells you so — ask the user
+  before installing anything into their environment.
 - **Apply only the safe autofixes**: `ruff check --fix` for the rules that are
   unambiguously behavior-preserving (unused imports `F401`, `pyupgrade`/`UP`,
   obvious `SIM`/`RET`). Review the diff; revert anything that smells semantic.
@@ -104,6 +107,8 @@ single highest-return habit in the whole campaign.
 
 - **Adopt one config and a CI gate.** A `pyproject.toml` with Ruff (lint + format),
   a type checker, and pytest+coverage. A CI workflow that runs all three on every PR.
+  Use `scripts/run_external_tools.py` to see which of these the environment already
+  has and to fold their output into the same findings format during the cleanup.
 - **Baseline, don't boil the ocean.** You can't fix every violation at once and you
   shouldn't block all work to try. Ratchet instead:
   - Coverage: `--cov-fail-under=<current>` — it can only climb.
