@@ -124,18 +124,28 @@ def changed_lines(base):
     return {f: lines for f, lines in changed.items() if Path(f).exists()}
 
 
-def _expand_to_definitions(filepath, lines):
-    """Add the `def`/`class` line of every definition whose body intersects the
-    changed lines. Detectors often anchor a finding at the (unchanged) def line
-    even when the change that caused it is inside the body — without this, a
-    diff that adds nesting inside an existing function would be silently clean."""
+# Statements whose header line anchors findings caused by lines inside their
+# body: definitions, plus control flow (e.g. duplicate_conditional_fragment and
+# type_switch anchor at the `if`, control_flag at the `while`, even when the
+# edit that caused them is on a branch/body line).
+_ANCHOR_NODES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+    ast.If, ast.While, ast.For, ast.AsyncFor, ast.Try, ast.TryStar, ast.With, ast.AsyncWith,
+)
+
+
+def _expand_to_anchors(filepath, lines):
+    """Add the header line of every definition or control-flow statement whose
+    body intersects the changed lines. Detectors often anchor a finding at the
+    (unchanged) header even when the change that caused it is inside the body —
+    without this, a diff that edits only branch bodies would be silently clean."""
     expanded = set(lines)
     try:
         tree = ast.parse(Path(filepath).read_text(encoding="utf-8", errors="replace"))
     except (OSError, SyntaxError, ValueError):
         return expanded
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, _ANCHOR_NODES):
             end = getattr(node, "end_lineno", node.lineno)
             if any(node.lineno <= ln <= end for ln in lines):
                 expanded.add(node.lineno)
@@ -174,7 +184,7 @@ def collect(base, all_lines):
         return None, None
     findings = []
     for filepath, lines in files.items():
-        accepted = None if lines is None else _expand_to_definitions(filepath, lines)
+        accepted = None if lines is None else _expand_to_anchors(filepath, lines)
         for script in DIFF_SAFE_SCRIPTS:
             issues, error = run_detector(script, filepath)
             if error is not None:

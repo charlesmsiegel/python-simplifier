@@ -61,6 +61,17 @@ def _is_dunder(name: str) -> bool:
     return name.startswith("__") and name.endswith("__")
 
 
+def _walk_same_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
+    """Walk statements without descending into nested scopes (defs, classes,
+    lambdas) — a name assigned there is a different variable."""
+    stack: list[ast.AST] = list(stmts)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
@@ -110,7 +121,6 @@ class DesignSmellDetector(ast.NodeVisitor):
         # Names that are imports or same-module classes: touching their _private
         # members is module-internal by convention, not cross-class intimacy.
         self.known_names: set[str] = set()
-        self.class_defs: dict[str, ast.ClassDef] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -119,8 +129,13 @@ class DesignSmellDetector(ast.NodeVisitor):
                 for alias in node.names:
                     self.known_names.add(alias.asname or alias.name)
             elif isinstance(node, ast.ClassDef):
-                self.class_defs[node.name] = node
                 self.known_names.add(node.name)
+        # Base-class resolution uses only module-level classes: nested classes in
+        # different containers can share a short name, and joining them would
+        # attribute one container's methods to the other's hierarchy.
+        self.class_defs: dict[str, ast.ClassDef] = {
+            n.name: n for n in tree.body if isinstance(n, ast.ClassDef)
+        }
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
@@ -245,7 +260,7 @@ class DesignSmellDetector(ast.NodeVisitor):
             and any(isinstance(t, ast.Name) and t.id == flag for t in inner.targets)
             and isinstance(inner.value, ast.Constant)
             and isinstance(inner.value.value, bool)
-            for stmt in node.body for inner in ast.walk(stmt)
+            for inner in _walk_same_scope(node.body)
         ):
             self._add(node.lineno, "control_flag",
                 f"Loop is steered by boolean flag '{flag}' reassigned in the body",
@@ -296,14 +311,18 @@ class DesignSmellDetector(ast.NodeVisitor):
                     and inner.value.id == "self":
                 if isinstance(inner.ctx, ast.Load):
                     disqualified.add(inner.attr)
+            targets, value = [], None
             if isinstance(inner, ast.Assign):
-                for target in inner.targets:
-                    if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) \
-                            and target.value.id == "self":
-                        if isinstance(inner.value, ast.Constant) and inner.value.value is None:
-                            none_fields.setdefault(target.attr, inner.lineno)
-                        else:
-                            disqualified.add(target.attr)
+                targets, value = inner.targets, inner.value
+            elif isinstance(inner, ast.AnnAssign) and inner.value is not None:
+                targets, value = [inner.target], inner.value
+            for target in targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) \
+                        and target.value.id == "self":
+                    if isinstance(value, ast.Constant) and value.value is None:
+                        none_fields.setdefault(target.attr, inner.lineno)
+                    else:
+                        disqualified.add(target.attr)
         if not none_fields:
             return
         usage: dict[str, set[str]] = defaultdict(set)
@@ -378,6 +397,10 @@ class DesignSmellDetector(ast.NodeVisitor):
             return
         if node.name.endswith(("Error", "Exception", "Warning")):
             return
+        # A docstring is the documented opt-out: a deliberate marker type that
+        # says what it marks has earned its keep.
+        if ast.get_docstring(node):
+            return
         if _body_kind(node.body) == "noop":
             self._add(node.lineno, "lazy_class",
                 f"Class '{node.name}' adds nothing over '{base.id}'",
@@ -395,7 +418,10 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[DesignSmell]:
         detector = DesignSmellDetector(str(filepath), lines, tree, ignore, is_test_file)
         detector.visit(tree)
         return detector.issues
-    except (SyntaxError, Exception):
+    # Only expected per-file failures are skipped; an unexpected detector bug
+    # must crash the process so analyze_all/analyze_diff report the category as
+    # not-evaluated instead of falsely clean.
+    except (SyntaxError, ValueError, OSError):
         return []
 
 

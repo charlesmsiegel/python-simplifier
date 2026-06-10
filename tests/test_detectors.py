@@ -634,6 +634,91 @@ def test_ladder_on_mixed_subjects_is_not_a_type_switch(tmp_path):
     assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
 
 
+def test_flag_assigned_only_in_nested_scope_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def wait(register):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        def callback():\n"
+        "            done = True\n"
+        "        register(callback)\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_documented_marker_subclass_is_not_lazy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Node:\n"
+        "    def walk(self):\n"
+        "        return []\n"
+        "\n"
+        "class Leaf(Node):\n"
+        '    """Marker type: distinguishes terminal nodes in isinstance checks."""\n'
+    )
+    assert "lazy_class" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_annotated_none_field_is_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch: object | None = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        return self.scratch\n"
+    )
+    assert "temporary_field" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_nested_classes_sharing_a_name_do_not_cross_hierarchies(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class ContainerA:\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            return 'a'\n"
+        "\n"
+        "class ContainerB:\n"
+        "    class Base:\n"
+        "        pass\n"
+        "\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_keeps_finding_anchored_at_unchanged_conditional(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        first()\n"
+        "    else:\n"
+        "        second()\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Edit only the branch bodies so they now end identically; the resulting
+    # duplicate_conditional_fragment finding anchors at the unchanged `if` line.
+    target.write_text(
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        log()\n"
+        "    else:\n"
+        "        log()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "duplicate_conditional_fragment" in found
+
+
 def test_abstract_stub_with_imported_base_is_not_refused_bequest(tmp_path):
     (tmp_path / "sample.py").write_text(
         "from abc import ABC, abstractmethod\n"
