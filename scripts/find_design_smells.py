@@ -72,6 +72,19 @@ def _walk_same_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
             stack.extend(ast.iter_child_nodes(node))
 
 
+def _walk_loop_level(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
+    """Walk statements without descending into nested scopes OR nested loops —
+    a flag assigned inside an inner loop cannot be replaced by a `break` of
+    the outer one."""
+    stack: list[ast.AST] = list(stmts)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                 ast.Lambda, ast.While, ast.For, ast.AsyncFor)):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
@@ -259,13 +272,15 @@ class DesignSmellDetector(ast.NodeVisitor):
                 and isinstance(node.test.operand, ast.Name)):
             flag, terminating = node.test.operand.id, True
         # Only the assignment that would *exit* this loop is a control flag:
-        # `running = True` inside `while running` keeps it going.
+        # `running = True` inside `while running` keeps it going. And only at
+        # this loop's own level — a `break` cannot substitute for a flag set
+        # inside a nested loop.
         if flag and any(
             isinstance(inner, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == flag for t in inner.targets)
             and isinstance(inner.value, ast.Constant)
             and inner.value.value is terminating
-            for inner in _walk_same_scope(node.body)
+            for inner in _walk_loop_level(node.body)
         ):
             self._add(node.lineno, "control_flag",
                 f"Loop is steered by boolean flag '{flag}' reassigned in the body",
@@ -332,6 +347,8 @@ class DesignSmellDetector(ast.NodeVisitor):
             return
         usage: dict[str, set[str]] = defaultdict(set)
         loaded_in: dict[str, set[str]] = defaultdict(set)
+        returned_in: dict[str, set[str]] = defaultdict(set)
+        reset_in: dict[str, set[str]] = defaultdict(set)
         accessor_like: set[str] = set()
         for method in self._methods(node):
             if method.name == "__init__":
@@ -345,17 +362,34 @@ class DesignSmellDetector(ast.NodeVisitor):
                     usage[inner.attr].add(method.name)
                     if isinstance(inner.ctx, ast.Load):
                         loaded_in[inner.attr].add(method.name)
+                if isinstance(inner, ast.Return) and inner.value is not None:
+                    for sub in ast.walk(inner.value):
+                        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) \
+                                and sub.value.id == "self" and sub.attr in none_fields:
+                            returned_in[sub.attr].add(method.name)
+                if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Constant) \
+                        and inner.value.value is None:
+                    for target in inner.targets:
+                        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) \
+                                and target.value.id == "self" and target.attr in none_fields:
+                            reset_in[target.attr].add(method.name)
         for attr, line in none_fields.items():
             if attr in disqualified:
                 continue
             methods = usage.get(attr, set())
+            if len(methods) != 1 or methods & accessor_like:
+                continue
+            only = next(iter(methods))
             # Lazy-init caches behind a property are idiomatic, not a smell.
-            # A field only *written* by its one method is an output field
-            # (self.result populated for callers), not method-local scratch —
-            # temporary fields are read back within the same operation.
-            if len(methods) == 1 and not methods & accessor_like \
-                    and methods & loaded_in.get(attr, set()):
-                only = next(iter(methods))
+            # A reset back to None inside the method proves the "None except
+            # during one operation" lifecycle. Without one, a field the method
+            # *returns* is an output for callers (part of the state model);
+            # a field only written is an output too; only a field read back
+            # without being exposed is method-local scratch.
+            is_temporary = only in reset_in.get(attr, set()) or (
+                only in loaded_in.get(attr, set())
+                and only not in returned_in.get(attr, set()))
+            if is_temporary:
                 self._add(line, "temporary_field",
                     f"Field 'self.{attr}' is None except inside '{only}' — a temporary field",
                     f"Pass the value through parameters or extract '{only}' and its data into "
@@ -404,6 +438,21 @@ class DesignSmellDetector(ast.NodeVisitor):
                     "The hierarchy is off: Replace Inheritance with Delegation, or push the truly "
                     "shared part into a new superclass (Extract Superclass)", "medium")
 
+    def _hierarchy_defines(self, class_name: str, method_name: str, seen: set[str] = None) -> bool:
+        """True if a same-file class (or its same-file ancestors) defines method_name."""
+        seen = seen or set()
+        if class_name in seen or class_name not in self.class_defs:
+            return False
+        seen.add(class_name)
+        cls = self.class_defs[class_name]
+        if any(isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name == method_name
+               for m in cls.body):
+            return True
+        return any(
+            isinstance(b, ast.Name) and self._hierarchy_defines(b.id, method_name, seen)
+            for b in cls.bases
+        )
+
     def _check_lazy_class(self, node: ast.ClassDef):
         if node.decorator_list or node.keywords or len(node.bases) != 1:
             return
@@ -417,6 +466,11 @@ class DesignSmellDetector(ast.NodeVisitor):
         # A docstring is the documented opt-out: a deliberate marker type that
         # says what it marks has earned its keep.
         if ast.get_docstring(node):
+            return
+        # A base hierarchy defining __init_subclass__ gives even an empty
+        # subclass observable class-creation behavior (plugin registration) —
+        # deleting it would unregister the plugin.
+        if self._hierarchy_defines(base.id, "__init_subclass__"):
             return
         if _body_kind(node.body) == "noop":
             self._add(node.lineno, "lazy_class",

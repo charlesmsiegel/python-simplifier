@@ -236,7 +236,7 @@ CASES = [
                 "\n"
                 "    def only_user(self):\n"
                 "        self.scratch = object()\n"
-                "        return self.scratch\n"
+                "        log(self.scratch)\n"
                 "\n"
                 "class Echo(Child):\n"
                 "    pass\n"
@@ -775,7 +775,7 @@ def test_annotated_none_field_is_a_temporary_field(tmp_path):
         "\n"
         "    def run(self):\n"
         "        self.scratch = object()\n"
-        "        return self.scratch\n"
+        "        log(self.scratch)\n"
     )
     assert "temporary_field" in smell_types(run_detector("find_design_smells.py", tmp_path))
 
@@ -1247,3 +1247,187 @@ def test_analyze_diff_drops_cross_definition_finding_on_unrelated_edit(tmp_path)
     )
     assert result.returncode == 0, result.stderr[:500]
     assert "getter_setter_pair" not in {f["smell_type"] for f in json.loads(result.stdout)}
+
+
+def test_validating_recorder_metaclass_is_not_a_singleton(tmp_path):
+    # A validation branch beside a recorder assignment is not instance caching:
+    # the guard must read the storage the instance lands in.
+    (tmp_path / "sample.py").write_text(
+        "class RecordingMeta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        if not args:\n"
+        "            raise ValueError('args required')\n"
+        "        cls.last_created = super().__call__(*args, **kwargs)\n"
+        "        return cls.last_created\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_metaclass_doing_more_than_registering_is_not_flagged(tmp_path):
+    # __init_subclass__ would not preserve the namespace rewriting.
+    (tmp_path / "sample.py").write_text(
+        "class BusyMeta(type):\n"
+        "    REGISTRY = {}\n"
+        "    def __new__(mcs, name, bases, ns):\n"
+        "        ns['extra'] = build_extra(ns)\n"
+        "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+        "        mcs.REGISTRY[name] = new_cls\n"
+        "        return new_cls\n"
+    )
+    assert "registry_metaclass" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_unconditional_recompute_is_not_memoization(tmp_path):
+    # Membership gate + write + return without hit-branch reuse: every call
+    # recomputes, so lru_cache would change behavior.
+    (tmp_path / "sample.py").write_text(
+        "CACHE = {}\n"
+        "\n"
+        "def refresh(key):\n"
+        "    if key in CACHE:\n"
+        "        audit(key)\n"
+        "    CACHE[key] = calculate(key)\n"
+        "    return CACHE[key]\n"
+    )
+    assert "handrolled_memoize" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_accessors_are_not_a_getter_setter_pair(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Remote:\n"
+        "    async def get_name(self):\n"
+        "        return self._name\n"
+        "    async def set_name(self, value):\n"
+        "        self._name = value\n"
+    )
+    assert "getter_setter_pair" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_lazy_property_not_pushed_to_cached_property(tmp_path):
+    # cached_property would cache the coroutine, which cannot be re-awaited.
+    (tmp_path / "sample.py").write_text(
+        "class Client:\n"
+        "    @property\n"
+        "    async def conn(self):\n"
+        "        if self._conn is None:\n"
+        "            self._conn = await connect()\n"
+        "        return self._conn\n"
+    )
+    assert "handrolled_lazy_property" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_decorated_strategy_classes_are_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Discount:\n"
+        "    def apply(self, order):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "@register\n"
+        "class TenPercent(Discount):\n"
+        "    def apply(self, order):\n"
+        "        return order * 0.9\n"
+        "\n"
+        "@register\n"
+        "class OnSale(Discount):\n"
+        "    def apply(self, order):\n"
+        "        return order * 0.5\n"
+    )
+    assert "stateless_strategy_classes" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_nested_function_state_does_not_implicate_outer_method(tmp_path):
+    # Compares/assigns inside a nested helper belong to that scope; with only
+    # one real outer method touching self.status there is no state machine.
+    (tmp_path / "sample.py").write_text(
+        "class Worker:\n"
+        "    def run(self):\n"
+        "        if self.status == 'new':\n"
+        "            self.status = 'busy'\n"
+        "\n"
+        "    def schedule(self):\n"
+        "        def helper():\n"
+        "            if self.status == 'busy':\n"
+        "                self.status = 'done'\n"
+        "        return helper\n"
+    )
+    assert "string_state_machine" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_returned_result_field_is_not_temporary(tmp_path):
+    # run() populates and returns self.result — an output, not scratch.
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.result = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.result = compute()\n"
+        "        return self.result\n"
+    )
+    assert "temporary_field" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_field_reset_to_none_is_temporary(tmp_path):
+    # An explicit reset proves the None-except-during-one-operation lifecycle.
+    (tmp_path / "sample.py").write_text(
+        "class Parser:\n"
+        "    def __init__(self):\n"
+        "        self.buffer = None\n"
+        "\n"
+        "    def parse(self, text):\n"
+        "        self.buffer = text.split()\n"
+        "        out = transform(self.buffer)\n"
+        "        self.buffer = None\n"
+        "        return out\n"
+    )
+    assert "temporary_field" in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_empty_subclass_of_registering_base_is_not_lazy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Plugin:\n"
+        "    registry = []\n"
+        "    def __init_subclass__(cls, **kwargs):\n"
+        "        super().__init_subclass__(**kwargs)\n"
+        "        Plugin.registry.append(cls)\n"
+        "\n"
+        "class CsvPlugin(Plugin):\n"
+        "    pass\n"
+    )
+    assert "lazy_class" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_flag_set_in_nested_loop_is_not_a_control_flag(tmp_path):
+    # A break at the assignment would exit only the inner for loop.
+    (tmp_path / "sample.py").write_text(
+        "def scan(batches):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        for item in next_batch():\n"
+        "            if item.is_last:\n"
+        "                done = True\n"
+        "        commit()\n"
+    )
+    assert "control_flag" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )

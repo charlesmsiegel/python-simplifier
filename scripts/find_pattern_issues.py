@@ -69,6 +69,25 @@ def _walk_same_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
             stack.extend(ast.iter_child_nodes(node))
 
 
+def _stmt_lists(stmts: list[ast.stmt]) -> Iterator[list[ast.stmt]]:
+    """Yield every statement list in the same scope (bodies of if/loops/try/
+    with), so sibling-statement order can be inspected without crossing into
+    nested defs/classes."""
+    stack: list[list[ast.stmt]] = [stmts]
+    while stack:
+        lst = stack.pop()
+        yield lst
+        for s in lst:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(s, attr, None)
+                if sub:
+                    stack.append(sub)
+            for handler in getattr(s, "handlers", []):
+                stack.append(handler.body)
+
+
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
@@ -249,17 +268,23 @@ class PatternIssueDetector(ast.NodeVisitor):
         for method in _methods(node):
             if method.name != "__call__":
                 continue
-            # The instance must be written to *persistent* storage (a subscript
-            # like cls._instances[cls], or an attribute) — assigning
-            # super().__call__() to a local for validation is not caching.
-            caches = any(
-                _is_super_call_to(inner.value, "__call__")
-                and any(isinstance(t, (ast.Subscript, ast.Attribute)) for t in inner.targets)
+            # The instance must land in persistent storage, and the guard must
+            # *read that same storage* to skip construction — an unrelated
+            # validation branch beside a recorder assignment is not caching.
+            storage = {
+                ast.unparse(t.value if isinstance(t, ast.Subscript) else t)
+                for inner in ast.walk(method) if isinstance(inner, ast.Assign)
+                and _is_super_call_to(inner.value, "__call__")
+                for t in inner.targets if isinstance(t, (ast.Subscript, ast.Attribute))
+            }
+            gated = any(
+                isinstance(inner, ast.If) and any(
+                    isinstance(n, (ast.Attribute, ast.Subscript, ast.Name))
+                    and ast.unparse(n) in storage
+                    for n in ast.walk(inner.test))
                 for inner in ast.walk(method)
-                if isinstance(inner, ast.Assign)
             )
-            gated = any(isinstance(inner, ast.If) for inner in ast.walk(method))
-            if caches and gated:
+            if storage and gated:
                 self._add(node.lineno, "handrolled_singleton",
                     f"Metaclass '{node.name}' caches instances in __call__ — a Singleton metaclass",
                     "A metaclass is the heaviest possible way to get one instance. Create the "
@@ -335,11 +360,31 @@ class PatternIssueDetector(ast.NodeVisitor):
                     return True
                 return isinstance(base, ast.Name) and base.id not in local_names
 
-            if any(isinstance(inner, ast.Assign)
-                   and any(isinstance(t, ast.Subscript) and is_persistent(t)
-                           for t in inner.targets)
-                   and isinstance(inner.value, ast.Name) and inner.value.id in new_cls_names
-                   for inner in ast.walk(method)):
+            def is_registry_write(stmt: ast.stmt) -> bool:
+                return (isinstance(stmt, ast.Assign)
+                        and any(isinstance(t, ast.Subscript) and is_persistent(t)
+                                for t in stmt.targets)
+                        and isinstance(stmt.value, ast.Name)
+                        and stmt.value.id in new_cls_names)
+
+            # __init_subclass__ only replaces a metaclass that does *nothing
+            # but* register: construction, the registry write, and the return
+            # must exhaust the body — validation or namespace rewriting is
+            # behavior the swap would silently drop.
+            def is_construction_or_return(stmt: ast.stmt) -> bool:
+                if isinstance(stmt, ast.Assign) and _is_super_call_to(stmt.value, "__new__"):
+                    return True
+                if isinstance(stmt, ast.Expr) and _is_super_call_to(stmt.value, "__init__"):
+                    return True
+                return isinstance(stmt, ast.Return) and (
+                    stmt.value is None
+                    or (isinstance(stmt.value, ast.Name) and stmt.value.id in new_cls_names)
+                    or _is_super_call_to(stmt.value, "__new__"))
+
+            stmts = _strip_docstring(method.body)
+            if any(is_registry_write(s) for s in stmts) \
+                    and all(is_registry_write(s) or is_construction_or_return(s)
+                            for s in stmts):
                 self._add(node.lineno, "registry_metaclass",
                     f"Metaclass '{node.name}' writes new classes into a registry",
                     "Use __init_subclass__ on the base class for subclass registration — "
@@ -358,7 +403,9 @@ class PatternIssueDetector(ast.NodeVisitor):
         properties = {m.name for m in _methods(node)
                       if _decorator_names(m) & {"property", "cached_property", "setter"}}
         for method in _methods(node):
-            if _decorator_names(method):
+            # async accessors are an API boundary (callers await them);
+            # swapping in a plain attribute would change every call site.
+            if not isinstance(method, ast.FunctionDef) or _decorator_names(method):
                 continue
             body = _strip_docstring(method.body)
             args = method.args.posonlyargs + method.args.args
@@ -384,6 +431,10 @@ class PatternIssueDetector(ast.NodeVisitor):
 
     def _check_lazy_properties(self, node: ast.ClassDef):
         for method in _methods(node):
+            # cached_property on an async def would cache the coroutine object,
+            # which cannot be awaited twice — sync methods only.
+            if not isinstance(method, ast.FunctionDef):
+                continue
             if "property" not in _decorator_names(method):
                 continue
             body = _strip_docstring(method.body)
@@ -502,7 +553,9 @@ class PatternIssueDetector(ast.NodeVisitor):
         first_line: dict[str, int] = {}
         involved: dict[str, set[int]] = defaultdict(set)
         for method in _methods(node):
-            for inner in ast.walk(method):
+            # Same-scope walk: a nested function's compares/assigns belong to
+            # that scope, not to this method's state handling.
+            for inner in _walk_same_scope(method.body):
                 if isinstance(inner, ast.Compare) and len(inner.ops) == 1 \
                         and isinstance(inner.ops[0], (ast.Eq, ast.NotEq)) \
                         and _is_self_attr(inner.left) \
@@ -547,6 +600,11 @@ class PatternIssueDetector(ast.NodeVisitor):
             method_names = set()
             ok = True
             for cls in subclasses:
+                # A class decorator (registration, DI, transformation) is
+                # class-creation behavior that plain functions would lose.
+                if cls.decorator_list:
+                    ok = False
+                    break
                 body = _strip_docstring(cls.body)
                 if len(body) != 1 \
                         or not isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)) \
@@ -558,6 +616,8 @@ class PatternIssueDetector(ast.NodeVisitor):
                 continue
             method = next(iter(method_names))
             base = self.class_defs[base_name]
+            if base.decorator_list:
+                continue
             base_extra = [s for s in _strip_docstring(base.body)
                           if not (isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))
                                   and s.name == method)
@@ -610,27 +670,45 @@ def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
                     return (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
                             and n.value.id == cache)
 
-                # Memoization = gate on membership, store a computed result, and
-                # hand the stored entry back. A dict that merely accumulates
-                # state (SESSIONS[k].append(...)) is a store, not a cache —
-                # mutating a cached entry disqualifies.
-                gates = writes = returns_cached = mutates_entry = False
+                def gate_test(test, op, cache=cache):
+                    return (isinstance(test, ast.Compare) and len(test.ops) == 1
+                            and isinstance(test.ops[0], op)
+                            and isinstance(test.comparators[0], ast.Name)
+                            and test.comparators[0].id == cache)
+
+                # Memoization must *reuse* the stored entry on the hit path:
+                # either `if k in CACHE: return CACHE[k]` (hit branch returns
+                # without reaching the write), or `if k not in CACHE: CACHE[k]
+                # = ...` immediately followed by `return CACHE[k]`. Independent
+                # gate/write/return booleans would also match functions that
+                # unconditionally recompute. Mutating an entry (accumulator
+                # dicts: SESSIONS[k].append(...)) disqualifies.
+                hit_reuse = writes = mutates_entry = False
+                for stmts in _stmt_lists(node.body):
+                    for i, stmt in enumerate(stmts):
+                        if not isinstance(stmt, ast.If):
+                            continue
+                        if gate_test(stmt.test, ast.In) and len(stmt.body) == 1 \
+                                and isinstance(stmt.body[0], ast.Return) \
+                                and is_cache_sub(stmt.body[0].value):
+                            hit_reuse = True
+                        if gate_test(stmt.test, ast.NotIn) and not stmt.orelse \
+                                and any(isinstance(s, ast.Assign)
+                                        and any(is_cache_sub(t) for t in s.targets)
+                                        for s in stmt.body) \
+                                and i + 1 < len(stmts) \
+                                and isinstance(stmts[i + 1], ast.Return) \
+                                and is_cache_sub(stmts[i + 1].value):
+                            hit_reuse = True
                 for inner in _walk_same_scope(node.body):
-                    if isinstance(inner, ast.Compare) and len(inner.ops) == 1 \
-                            and isinstance(inner.ops[0], (ast.In, ast.NotIn)) \
-                            and isinstance(inner.comparators[0], ast.Name) \
-                            and inner.comparators[0].id == cache:
-                        gates = True
                     if isinstance(inner, ast.Assign) \
                             and any(is_cache_sub(t) for t in inner.targets):
                         writes = True
-                    if isinstance(inner, ast.Return) and is_cache_sub(inner.value):
-                        returns_cached = True
                     if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
                             and is_cache_sub(inner.func.value)) \
                             or (isinstance(inner, ast.AugAssign) and is_cache_sub(inner.target)):
                         mutates_entry = True
-                if gates and writes and returns_cached and not mutates_entry:
+                if hit_reuse and writes and not mutates_entry:
                     add(node.lineno, "handrolled_memoize",
                         f"'{node.name}' hand-rolls memoization through module-level dict '{cache}'",
                         "Use @functools.lru_cache (or @functools.cache) if the function is pure "
