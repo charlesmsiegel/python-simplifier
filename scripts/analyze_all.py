@@ -80,6 +80,36 @@ def generate_report(path: str, skip_duplicates: bool = False) -> dict:
     print("🔍 Finding comment smells...", file=sys.stderr)
     results['comment_smells'] = run_analyzer('find_comment_smells.py', path)
 
+    print("🔍 Finding resource leaks...", file=sys.stderr)
+    results['resource_leaks'] = run_analyzer('find_resource_leaks.py', path)
+
+    print("🔍 Finding security issues...", file=sys.stderr)
+    results['security'] = run_analyzer('find_security_issues.py', path)
+
+    print("🔍 Finding import cycles / god modules...", file=sys.stderr)
+    results['import_cycles'] = run_analyzer('find_import_cycles.py', path)
+
+    print("🔍 Finding debug leftovers...", file=sys.stderr)
+    results['debug_leftovers'] = run_analyzer('find_debug_leftovers.py', path)
+
+    print("🔍 Finding outdated idioms...", file=sys.stderr)
+    results['outdated_idioms'] = run_analyzer('find_outdated_idioms.py', path)
+
+    print("🔍 Finding missing docstrings...", file=sys.stderr)
+    results['missing_docstrings'] = run_analyzer('find_missing_docstrings.py', path)
+
+    print("🔍 Finding type-annotation gaps...", file=sys.stderr)
+    results['type_gaps'] = run_analyzer('find_type_gaps.py', path)
+
+    print("🔍 Checking dependency hygiene...", file=sys.stderr)
+    results['dependency_issues'] = run_analyzer('find_dependency_issues.py', path)
+
+    print("🔍 Finding untested modules...", file=sys.stderr)
+    results['untested_modules'] = run_analyzer('find_untested_modules.py', path)
+
+    print("🔍 Finding test smells...", file=sys.stderr)
+    results['test_smells'] = run_analyzer('find_test_smells.py', path)
+
     if not skip_duplicates:
         print("🔍 Finding duplicates...", file=sys.stderr)
         results['duplicates'] = run_analyzer('find_duplicates.py', path)
@@ -224,6 +254,26 @@ def print_text_report(report: dict):
         recommendations.append("• Fix names - stop shadowing builtins, follow snake_case/PascalCase")
     if summary['by_category'].get('comment_smells', 0) > 0:
         recommendations.append("• Delete commented-out code; move TODOs into the tracker")
+    if summary['by_category'].get('resource_leaks', 0) > 0:
+        recommendations.append("• Wrap file/socket handles in 'with' so they close deterministically")
+    if summary['by_category'].get('security', 0) > 0:
+        recommendations.append("• Address security risks - eval/exec, shell=True, unsafe yaml/pickle, hardcoded secrets")
+    if summary['by_category'].get('import_cycles', 0) > 0:
+        recommendations.append("• Break import cycles and split god modules; thin out __init__.py")
+    if summary['by_category'].get('untested_modules', 0) > 0:
+        recommendations.append("• Build the safety net first - characterize untested modules before refactoring")
+    if summary['by_category'].get('test_smells', 0) > 0:
+        recommendations.append("• Fix hollow tests - add assertions, cut over-mocking, remove logic from tests")
+    if summary['by_category'].get('dependency_issues', 0) > 0:
+        recommendations.append("• Reconcile dependencies - declare missing, drop unused, pin versions")
+    if summary['by_category'].get('debug_leftovers', 0) > 0:
+        recommendations.append("• Remove debugger calls and stray prints left in the source")
+    if summary['by_category'].get('outdated_idioms', 0) > 0:
+        recommendations.append("• Modernize idioms - f-strings, builtin generics, pathlib, bare super()")
+    if summary['by_category'].get('type_gaps', 0) > 0:
+        recommendations.append("• Add type annotations at API boundaries; adopt mypy/pyright incrementally")
+    if summary['by_category'].get('missing_docstrings', 0) > 0:
+        recommendations.append("• Document the public API surface with intent-revealing docstrings")
 
     if not recommendations:
         recommendations.append("• Your code is in good shape! Consider minor improvements.")
@@ -254,6 +304,16 @@ Runs all analysis checks:
   - Loop simplifications (comprehensions, any/all, join)
   - Naming issues (shadowed builtins, casing)
   - Comment smells (commented-out code, TODOs)
+  - Resource leaks (open/socket without a context manager)
+  - Security issues (eval/exec, shell=True, unsafe yaml/pickle, secrets)
+  - Import cycles & god modules (circular imports, wildcard imports)
+  - Debug leftovers (pdb/breakpoint/stray prints)
+  - Outdated idioms (%/format, old typing, os.path, super(args))
+  - Missing docstrings (public API surface)
+  - Type-annotation gaps (missing annotations, Any, broad type:ignore)
+  - Dependency hygiene (missing/unused/unpinned deps)
+  - Untested modules (safety-net gaps before refactoring)
+  - Test smells (assertion-less tests, over-mocking, logic in tests)
   - Duplicate code (AST-based similarity)
 
 Examples:
