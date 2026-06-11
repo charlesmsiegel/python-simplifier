@@ -3,6 +3,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual fallback: creates the tag (pointed at the dispatched ref) along
+  # with the release, for environments that can't push tags directly.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: write
@@ -44,7 +51,10 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" python-simplifier.skill \
-            --title "python-simplifier $GITHUB_REF_NAME" \
+          # --target only applies when the tag doesn't exist yet (dispatch path).
+          gh release create "$TAG" python-simplifier.skill \
+            --target "$GITHUB_SHA" \
+            --title "python-simplifier $TAG" \
             --notes "Agent skill for critically reviewing and simplifying Python code. Download \`python-simplifier.skill\` and install it in Claude Code (\`~/.claude/skills/\`) or upload it to claude.ai."
