@@ -34,6 +34,8 @@ from collections import defaultdict
 DIFF_SAFE_SCRIPTS = [
     "analyze_complexity.py",
     "find_code_smells.py",
+    "find_design_smells.py",
+    "find_pattern_issues.py",
     "find_unpythonic.py",
     "find_mutation_hazards.py",
     "find_exception_issues.py",
@@ -123,18 +125,28 @@ def changed_lines(base):
     return {f: lines for f, lines in changed.items() if Path(f).exists()}
 
 
-def _expand_to_definitions(filepath, lines):
-    """Add the `def`/`class` line of every definition whose body intersects the
-    changed lines. Detectors often anchor a finding at the (unchanged) def line
-    even when the change that caused it is inside the body — without this, a
-    diff that adds nesting inside an existing function would be silently clean."""
+# Statements whose header line anchors findings caused by lines inside their
+# body: definitions, plus control flow (e.g. duplicate_conditional_fragment and
+# type_switch anchor at the `if`, control_flag at the `while`, even when the
+# edit that caused them is on a branch/body line).
+_ANCHOR_NODES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+    ast.If, ast.While, ast.For, ast.AsyncFor, ast.Try, ast.TryStar, ast.With, ast.AsyncWith,
+)
+
+
+def _expand_to_anchors(filepath, lines):
+    """Add the header line of every definition or control-flow statement whose
+    body intersects the changed lines. Detectors often anchor a finding at the
+    (unchanged) header even when the change that caused it is inside the body —
+    without this, a diff that edits only branch bodies would be silently clean."""
     expanded = set(lines)
     try:
         tree = ast.parse(Path(filepath).read_text(encoding="utf-8", errors="replace"))
     except (OSError, SyntaxError, ValueError):
         return expanded
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, _ANCHOR_NODES):
             end = getattr(node, "end_lineno", node.lineno)
             if any(node.lineno <= ln <= end for ln in lines):
                 expanded.add(node.lineno)
@@ -173,7 +185,7 @@ def collect(base, all_lines):
         return None, None
     findings = []
     for filepath, lines in files.items():
-        accepted = None if lines is None else _expand_to_definitions(filepath, lines)
+        accepted = None if lines is None else _expand_to_anchors(filepath, lines)
         for script in DIFF_SAFE_SCRIPTS:
             issues, error = run_detector(script, filepath)
             if error is not None:
@@ -190,7 +202,14 @@ def collect(base, all_lines):
                 if not isinstance(issue, dict):
                     continue
                 ln = issue.get("line")
-                if all_lines or accepted is None or (isinstance(ln, int) and ln in accepted):
+                # Cross-definition findings (e.g. a getter/setter pair, a
+                # strategy hierarchy) anchor at one definition but list every
+                # participant in related_lines; the finding belongs to the diff
+                # when *any* participant changed.
+                related = issue.get("related_lines") or []
+                if all_lines or accepted is None \
+                        or (isinstance(ln, int) and ln in accepted) \
+                        or any(isinstance(r, int) and r in accepted for r in related):
                     issue.setdefault("severity", "medium")
                     findings.append(issue)
     # De-dupe identical findings (a line can be flagged by overlapping detectors).

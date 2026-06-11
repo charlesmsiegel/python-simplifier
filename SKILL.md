@@ -1,6 +1,6 @@
 ---
 name: python-simplifier
-description: Critically review and simplify Python code — aggressively. Use whenever the user wants to simplify, refactor, clean up, make more readable, reduce complexity, improve code quality, find code smells, find bugs from shared mutable state or bad exception handling, detect duplication or data clumps, fix naming, remove dead code or over-engineering, enforce consistent patterns, audit a Python codebase, find resource leaks or security risks, break import cycles and god modules, modernize dated idioms, add type annotations, reconcile a dependency manifest, build a test safety net (characterization tests) before refactoring, find weak tests, review AI-generated / vibe-coded code or a change request for hallucinated APIs, stubs, swallowed errors and tests that can't fail, find imports buried in functions, run the repo's own tools (ruff/mypy/black/isort/bandit) when installed, or clean up an entire poorly-written-but-working repository from cold. Triggers on "simplify this", "this is too complex", "make this cleaner/more readable", "refactor this", "clean this up", "review my code", "find issues", "is this over-engineered", "analyze this codebase", or any review where the goal is simpler, more consistent, more correct Python. Combines deterministic AST detectors (run them) with judgment-based review guides in references/ (load them). Use this even when the user just pastes Python and asks "what do you think?". For Django-specific analysis, use the django-simplifier skill instead.
+description: Critically review and simplify Python code — aggressively. Use whenever the user wants to simplify, refactor, clean up, make more readable, reduce complexity, improve code quality, find code smells, find bugs from shared mutable state or bad exception handling, detect duplication or data clumps, fix naming, remove dead code or over-engineering, enforce consistent patterns, judge whether a design pattern (GoF — singleton, factory, strategy, observer, builder, etc.) is warranted or should be replaced with a Python-native form, find hand-rolled singletons/builders/iterators/memoization or string-typed state machines, audit a Python codebase, find resource leaks or security risks, break import cycles and god modules, modernize dated idioms, add type annotations, reconcile a dependency manifest, build a test safety net (characterization tests) before refactoring, find weak tests, review AI-generated / vibe-coded code or a change request for hallucinated APIs, stubs, swallowed errors and tests that can't fail, find imports buried in functions, run the repo's own tools (ruff/mypy/black/isort/bandit) when installed, or clean up an entire poorly-written-but-working repository from cold. Triggers on "simplify this", "this is too complex", "make this cleaner/more readable", "refactor this", "clean this up", "review my code", "find issues", "is this over-engineered", "analyze this codebase", or any review where the goal is simpler, more consistent, more correct Python. Combines deterministic AST detectors (run them) with judgment-based review guides in references/ (load them). Use this even when the user just pastes Python and asks "what do you think?". For Django-specific analysis, use the django-simplifier skill instead.
 ---
 
 # Python Code Simplifier
@@ -86,6 +86,7 @@ python scripts/find_coupling_issues.py .       # Feature envy, low cohesion (LCO
 python scripts/find_code_smells.py .           # Mutable defaults, bare excepts, magic numbers, god classes
 python scripts/find_dead_code.py .             # Unused imports/functions/params, unreachable code
 python scripts/find_overengineering.py .       # Single-impl interfaces, factories, thin wrappers (YAGNI)
+python scripts/find_design_smells.py .         # Classic-catalog smells: type-switches, refused bequest, temporary fields, intimacy
 python scripts/find_unpythonic.py .            # range(len), == True/None, manual index tracking
 
 # Correctness bugs (these find real bugs, not style)
@@ -111,6 +112,7 @@ python scripts/find_local_imports.py .         # Imports inside functions / not 
 python scripts/find_redundant_comments.py .    # Comments that just narrate the next line (NOISY — opt-in, not in analyze_all)
 
 # Design & simplification
+python scripts/find_pattern_issues.py .        # Design-pattern issues both ways: hand-rolled singletons/builders/iterators/memoize → Python-native form; string state machines, try/finally cleanup → the missing pattern
 python scripts/find_parameter_objects.py .     # Data clumps: parameter groups recurring across functions
 python scripts/find_boolean_params.py .        # Boolean flag parameters at definitions
 python scripts/find_return_issues.py .         # Inconsistent returns, if/else-returns-bool
@@ -177,9 +179,11 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 |---|---|
 | Starting any review — the master stance, workflow, critical-questions checklist, triage | `references/critical-review-guide.md` |
 | Deciding whether an abstraction should exist; DRY vs the wrong abstraction; YAGNI | `references/overengineering-and-abstraction.md` |
-| You see design smells by reading (feature envy, divergent change, shotgun surgery, primitive obsession, temporal coupling, god class, message chains) | `references/refactoring-catalog.md` |
+| Diagnosing design smells — the full classic catalog (bloaters, OO abusers, change preventers, dispensables, couplers) and triaging detector candidates | `references/refactoring-catalog.md` |
+| Executing a fix — the named refactoring techniques, safe step-by-step mechanics, Python equivalents of the classic moves | `references/refactoring-techniques.md` |
 | Judging names, comments, and function shape; deleting comments that lie | `references/naming-comments-readability.md` |
 | Choosing the right Python pattern AND making the codebase use it consistently | `references/patterns-and-consistency.md` |
+| Judging design patterns (GoF + Python-specific): when a pattern is warranted, when it's ceremony, the Python-native form of each, smell→pattern and pattern→simpler maps | `references/design-patterns.md` |
 | You want concrete before/after idiom swaps | `references/python-idioms.md` |
 | Cleaning up a whole poorly-written-but-working repo from cold — the phased campaign (run it, net it, normalize, triage, ratchet) | `references/messy-repo-runbook.md` |
 | Building the test safety net before refactoring — coverage maps, characterization & golden-master tests, spotting hollow tests | `references/safety-net-and-testing.md` |
@@ -193,6 +197,9 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | Single-impl interface/ABC | Abstraction over one thing | Merge; a mock is not a second impl |
 | Unnecessary factory | Builds one type | Direct instantiation |
 | Premature strategy | One strategy | A function |
+| Hand-rolled Singleton/Borg | Global state with ceremony | Module-level instance; better, pass it in |
+| Stateless strategy/command classes | Classes standing in for functions | Plain functions + dispatch dict |
+| Fluent builder | kwargs reimplemented as a class | Keyword arguments / dataclass |
 | Thin wrapper / middle man | Only forwards calls | Use the wrapped object |
 | Speculative generality | Code for "future needs" | Delete it (YAGNI) |
 | Config never varied | A param with one value | Hardcode; drop the param |
@@ -207,9 +214,19 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | Bare/broad except, swallowed error, `raise` without `from` | Catch narrow, chain with `from`, never `pass` |
 | God class / long function / deep nesting | Extract class/method; guard clauses |
 | Feature envy / message chains | Move method; hide delegate |
+| Reaching into `other._private` internals | Move method, or expose an intentional API |
+| Field that is `None` except in one method | Pass parameters or extract the method object |
+| Subclass that no-ops/raises on inherited methods | Composition (refused bequest) |
+| Same statement in every if/elif branch | Hoist it out of the conditional |
+| Bool flag steering a while loop | `break`/`return` at the decision point |
 | Data clump (params travelling together) | Bundle into a dataclass |
 | Boolean flag parameter | Split the function or use an enum |
 | if/elif type-switch | Dispatch dict or polymorphism |
+| String-typed state machine (`self.state == "..."` across methods) | Enum; dispatch/State pattern if behavior branches |
+| `get_x()`/`set_x()` accessor pair | Plain attribute (`@property` when logic arrives) |
+| Hand-rolled lazy property / memoize dict | `functools.cached_property` / `lru_cache` |
+| `__iter__`/`__next__` iterator class | Generator function (`yield`) |
+| `__del__` for cleanup; try/finally that only closes | Context manager (`with`) |
 | Magic numbers/strings | Named constants / enums |
 | Commented-out code | Delete it (git remembers) |
 | `f = open(...)` without `with` | Use `with open(...) as f:` (deterministic close) |
