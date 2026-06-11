@@ -24,10 +24,11 @@ import re
 import ast
 import sys
 import json
+import tempfile
 import argparse
 import subprocess
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # Per-file detectors only. Each is meaningful on a single file and reports a line
 # within that file. Whole-repo detectors are excluded on purpose (see module docstring).
@@ -60,7 +61,7 @@ DIFF_SAFE_SCRIPTS = [
 ]
 
 _ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def _git(args):
@@ -91,29 +92,61 @@ def resolve_base(explicit):
 
 
 def changed_lines(base):
-    """Return {abs_path: set_of_changed_line_numbers or None (=all lines)},
-    or None if git diff itself failed (e.g. unknown base ref)."""
-    changed = {}
+    """Return ({abs_path: set_of_changed_line_numbers or None (=all lines)},
+    {abs_path: base_side_relative_path or None},
+    {abs_path: [(old_start, old_count, new_start, new_count), ...]}),
+    or (None, None, None) if git diff itself failed (e.g. unknown base ref).
+    The base-side path (the `---` line) differs from the current path for
+    renames and is None for new files — it is what `git show base:path` needs
+    for baseline analysis; the hunks map unchanged lines between revisions."""
+    changed, rels, hunks = {}, {}, {}
     # core.quotePath=false keeps non-ASCII filenames literal instead of
     # octal-escaped+quoted, so the paths resolve on the filesystem.
     diff = _git(["-c", "core.quotePath=false", "diff", "--unified=0", "--no-color", base, "--", "*.py"])
     if diff is None:
-        return None
+        return None, None, None
     if diff:
         current = None
+        old = None
+        pending_rename_from = None
         for line in diff.splitlines():
-            if line.startswith("+++ "):
+            if line.startswith("rename from "):
+                pending_rename_from = line[len("rename from "):].strip()
+            elif line.startswith("rename to ") and pending_rename_from is not None:
+                # A 100% rename has no ---/+++/hunk lines, but the path change
+                # itself can matter (e.g. a file leaving tests/ becomes
+                # production code). Register it with no changed lines: every
+                # finding is then baseline-gated against the old path with an
+                # identity line mapping.
+                target = line[len("rename to "):].strip()
+                if target.endswith(".py"):
+                    key = str(Path(target).resolve())
+                    changed.setdefault(key, set())
+                    rels[key] = pending_rename_from
+                    hunks.setdefault(key, [])
+                pending_rename_from = None
+            elif line.startswith("--- "):
+                source = line[4:].strip()
+                old = None if source == "/dev/null" else source[2:] if source.startswith("a/") else source
+            elif line.startswith("+++ "):
                 target = line[4:].strip()
                 current = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
                 if current is not None:
-                    changed.setdefault(str(Path(current).resolve()), set())
+                    key = str(Path(current).resolve())
+                    changed.setdefault(key, set())
+                    rels[key] = old
+                    hunks.setdefault(key, [])
             elif current is not None and line.startswith("@@"):
                 m = _HUNK.match(line)
                 if m:
-                    start = int(m.group(1))
-                    count = int(m.group(2)) if m.group(2) is not None else 1
+                    old_start = int(m.group(1))
+                    old_count = int(m.group(2)) if m.group(2) is not None else 1
+                    start = int(m.group(3))
+                    count = int(m.group(4)) if m.group(4) is not None else 1
+                    key = str(Path(current).resolve())
+                    hunks[key].append((old_start, old_count, start, count))
                     for ln in range(start, start + count):
-                        changed[str(Path(current).resolve())].add(ln)
+                        changed[key].add(ln)
     # Untracked new files: treat every line as changed.
     others = _git(["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", "*.py"])
     if others:
@@ -121,36 +154,79 @@ def changed_lines(base):
             rel = rel.strip()
             if rel:
                 changed[str(Path(rel).resolve())] = None
+                rels[str(Path(rel).resolve())] = None  # untracked: nothing at base
     # Drop files that no longer exist on disk (pure deletions).
-    return {f: lines for f, lines in changed.items() if Path(f).exists()}
+    return {f: lines for f, lines in changed.items() if Path(f).exists()}, rels, hunks
 
 
-# Statements whose header line anchors findings caused by lines inside their
-# body: definitions, plus control flow (e.g. duplicate_conditional_fragment and
-# type_switch anchor at the `if`, control_flag at the `while`, even when the
-# edit that caused them is on a branch/body line).
-_ANCHOR_NODES = (
-    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-    ast.If, ast.While, ast.For, ast.AsyncFor, ast.Try, ast.TryStar, ast.With, ast.AsyncWith,
-)
+# Definition headers whose body intersects the changed lines are accepted
+# unconditionally: a finding on a def you edited is review-relevant even if it
+# predates the edit. Any OTHER finding in a changed file is baseline-gated —
+# reported only when absent at the base revision — because a change can
+# introduce findings anchored at arbitrary unchanged lines: the enclosing `if`
+# of an edited branch, a temporary field's initializer when a method changes,
+# a subclass's method when its base changes.
+_DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
-def _expand_to_anchors(filepath, lines):
-    """Add the header line of every definition or control-flow statement whose
-    body intersects the changed lines. Detectors often anchor a finding at the
-    (unchanged) header even when the change that caused it is inside the body —
-    without this, a diff that edits only branch bodies would be silently clean."""
-    expanded = set(lines)
+def _expand_to_definitions(filepath, lines):
+    """Changed lines plus the header line of every definition whose body
+    intersects them."""
+    accepted = set(lines)
     try:
         tree = ast.parse(Path(filepath).read_text(encoding="utf-8", errors="replace"))
     except (OSError, SyntaxError, ValueError):
-        return expanded
+        return accepted
     for node in ast.walk(tree):
-        if isinstance(node, _ANCHOR_NODES):
+        if isinstance(node, _DEF_NODES):
             end = getattr(node, "end_lineno", node.lineno)
             if any(node.lineno <= ln <= end for ln in lines):
-                expanded.add(node.lineno)
-    return expanded
+                accepted.add(node.lineno)
+    return accepted
+
+
+def _line_mapper(hunks):
+    """Map a new-side line to its base-side line (None when the line itself was
+    added/modified). An unchanged line is the same construct in both revisions,
+    which makes baseline matching structural rather than rank-based."""
+    def to_base(n):
+        delta = 0
+        for old_start, old_count, new_start, new_count in hunks:
+            if new_count > 0 and new_start <= n < new_start + new_count:
+                return None
+            if (new_count == 0 and new_start < n) or (new_count > 0 and new_start + new_count <= n):
+                delta += new_count - old_count
+        return n - delta
+    return to_base
+
+
+def _baseline_counts(base, rel):
+    """Multiset of findings the detectors produce for the base revision of one
+    changed file, keyed by (script, type, description, base line). Candidates
+    anchored at an unchanged head line are mapped to their base line via the
+    diff hunks, so a finding is suppressed only when the *same construct*
+    already produced it at base. New files have an empty baseline."""
+    counts = Counter()
+    if not rel:
+        return counts
+    content = _git(["show", f"{base}:{rel}"])
+    if content is None:
+        return counts
+    with tempfile.TemporaryDirectory() as td:
+        # Recreate the base-side relative path: path-sensitive detectors (test
+        # heuristics keyed on tests/ directories) must see the same context in
+        # both revisions.
+        snapshot = Path(td) / rel
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(content, encoding="utf-8")
+        for script in DIFF_SAFE_SCRIPTS:
+            issues, error = run_detector(script, str(snapshot))
+            if error is not None:
+                continue  # no baseline for this script → its findings stay visible (safe direction)
+            for issue in issues:
+                if isinstance(issue, dict):
+                    counts[(script, _type_of(issue), issue.get("description"), issue.get("line"))] += 1
+    return counts
 
 
 def run_detector(script, filepath):
@@ -180,12 +256,27 @@ def run_detector(script, filepath):
 
 
 def collect(base, all_lines):
-    files = changed_lines(base)
+    files, rels, hunks_by_file = changed_lines(base)
     if files is None:
         return None, None
     findings = []
     for filepath, lines in files.items():
-        accepted = None if lines is None else _expand_to_anchors(filepath, lines)
+        file_hunks = hunks_by_file.get(filepath) or []
+        # Deletion-only hunks leave nothing on the new side, but can still
+        # introduce findings (e.g. removing one branch's distinct final
+        # statement). Their neighboring lines discover the affected enclosing
+        # definitions — but are NOT accepted themselves: findings sitting on a
+        # merely-shifted line stay baseline-gated.
+        seeds = set()
+        for _, _, new_start, new_count in file_hunks:
+            if new_count == 0:
+                seeds.update({max(new_start, 1), new_start + 1})
+        if lines is None:
+            accepted = None
+        else:
+            accepted = _expand_to_definitions(filepath, lines | seeds) - (seeds - lines)
+        to_base = _line_mapper(file_hunks)
+        baseline = None  # computed lazily — only when a gated finding appears
         for script in DIFF_SAFE_SCRIPTS:
             issues, error = run_detector(script, filepath)
             if error is not None:
@@ -210,6 +301,18 @@ def collect(base, all_lines):
                 if all_lines or accepted is None \
                         or (isinstance(ln, int) and ln in accepted) \
                         or any(isinstance(r, int) and r in accepted for r in related):
+                    issue.setdefault("severity", "medium")
+                    findings.append(issue)
+                elif isinstance(ln, int):
+                    # Anywhere else in a changed file: report only what the
+                    # change introduced relative to the base revision.
+                    if baseline is None:
+                        baseline = _baseline_counts(base, rels.get(filepath))
+                    base_ln = to_base(ln)
+                    key = (script, _type_of(issue), issue.get("description"), base_ln)
+                    if base_ln is not None and baseline[key] > 0:
+                        baseline[key] -= 1  # same construct already produced this at base
+                        continue
                     issue.setdefault("severity", "medium")
                     findings.append(issue)
     # De-dupe identical findings (a line can be flagged by overlapping detectors).
