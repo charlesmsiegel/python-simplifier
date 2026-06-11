@@ -828,6 +828,894 @@ def test_analyze_diff_keeps_finding_anchored_at_unchanged_conditional(tmp_path):
     assert "duplicate_conditional_fragment" in found
 
 
+def test_deferred_none_assignment_in_init_callback_is_not_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self, register):\n"
+        "        def reset():\n"
+        "            self.scratch = None\n"
+        "        register(reset)\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        return self.scratch\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_field_only_read_back_as_none_is_not_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.result = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        return self.result\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_nested_concrete_hierarchy_still_reports_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Container:\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            return 'base'\n"
+        "\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+    )
+    assert "refused_bequest" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_enum_member_ladder_is_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(kind):\n"
+        "    if kind == Kind.CREATE:\n"
+        "        return 1\n"
+        "    elif kind == Kind.UPDATE:\n"
+        "        return 2\n"
+        "    elif kind == Kind.DELETE:\n"
+        "        return 3\n"
+        "    elif kind == Kind.LIST:\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    assert "type_switch" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_chained_receivers_are_inappropriate_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Billing:\n"
+        "    def charge(self, request):\n"
+        "        token = self.account._token\n"
+        "        state = request.user._state\n"
+        "        return token, state\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 2
+
+
+def test_callback_inside_dunder_is_not_exempt_from_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Watcher:\n"
+        "    def __init__(self, other, register):\n"
+        "        def callback():\n"
+        "            return other._secret\n"
+        "        register(callback)\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_parameter_shadowing_class_name_is_not_exempt_from_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Account:\n"
+        "    def balance(self):\n"
+        "        return 0\n"
+        "\n"
+        "def expose(Account):\n"
+        "    return Account._token\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_skips_preexisting_finding_at_unchanged_conditional(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    ladder = (
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        return {}\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    elif kind == 'd':\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    target.write_text(ladder)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Edit one branch body; the dispatch structure is unchanged, so the
+    # pre-existing type_switch at the `if` header must not resurface.
+    target.write_text(ladder.replace("return {}", "return 10"))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "type_switch" not in found
+
+
+def test_local_reassignment_of_class_name_is_not_exempt_from_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Account:\n"
+        "    def balance(self):\n"
+        "        return 0\n"
+        "\n"
+        "def expose(factory):\n"
+        "    Account = factory()\n"
+        "    return Account._token\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_noop_method_on_earlier_base_shadows_concrete_later_base(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class NoopBase:\n"
+        "    def render(self):\n"
+        "        pass\n"
+        "\n"
+        "class Concrete:\n"
+        "    def render(self):\n"
+        "        return 'x'\n"
+        "\n"
+        "class FollowsNoop(NoopBase, Concrete):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class FollowsConcrete(Concrete, NoopBase):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "refused_bequest"]
+    # MRO reaches NoopBase.render first for FollowsNoop: nothing concrete is refused.
+    assert len(findings) == 1 and "FollowsConcrete" in findings[0]["description"]
+
+
+def test_annotated_flag_assignment_is_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def wait(jobs):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        if not jobs:\n"
+        "            done: bool = True\n"
+    )
+    assert "control_flag" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_suffix_named_test_module_is_exempt_from_intimacy(tmp_path):
+    (tmp_path / "account_test.py").write_text(
+        "def check(account):\n"
+        "    assert account._token is None\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_uses_prerename_path_for_baseline(tmp_path):
+    _git(tmp_path, "init", "-q")
+    ladder = (
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        return {}\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    elif kind == 'd':\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    (tmp_path / "mod.py").write_text(ladder)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    _git(tmp_path, "mv", "mod.py", "renamed.py")
+    (tmp_path / "renamed.py").write_text(ladder.replace("return {}", "return 10"))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "type_switch" not in found
+
+
+def test_analyze_diff_baseline_does_not_mask_identical_finding_elsewhere(tmp_path):
+    _git(tmp_path, "init", "-q")
+    f1 = (
+        "def f1(kind):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    elif kind == 'd':\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    f2_base = (
+        "def f2(kind):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    return 0\n"
+    )
+    target = tmp_path / "mod.py"
+    target.write_text(f1 + "\n" + f2_base)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # f2 grows a fourth branch: a NEW type_switch with a description identical
+    # to f1's pre-existing one. The def-scoped baseline must not consume it.
+    f2_head = f2_base.replace(
+        "    return 0\n",
+        "    elif kind == 'd':\n        return 4\n    return 0\n",
+    )
+    target.write_text(f1 + "\n" + f2_head)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f["smell_type"] == "type_switch"]
+    assert len(switches) == 1
+
+
+def test_callback_only_usage_is_not_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self, register):\n"
+        "        def callback():\n"
+        "            self.scratch = object()\n"
+        "            return self.scratch\n"
+        "        register(callback)\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_diamond_mro_resolves_noop_before_concrete(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class A:\n"
+        "    def render(self):\n"
+        "        return 'a'\n"
+        "\n"
+        "class B(A):\n"
+        "    def other(self):\n"
+        "        return 1\n"
+        "\n"
+        "class C(A):\n"
+        "    def render(self):\n"
+        "        pass\n"
+        "\n"
+        "class D(B, C):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    # Python's MRO for D is [D, B, C, A]: lookup reaches C's no-op render, so
+    # D refuses nothing concrete (C itself legitimately overrides A's).
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "refused_bequest" and "'D." in f["description"]]
+    assert findings == []
+
+
+def test_analyze_diff_baseline_distinguishes_same_named_methods(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    def handle(cls_name, branches):
+        body = "".join(
+            f"        {'if' if i == 0 else 'elif'} kind == '{chr(97 + i)}':\n            return {i}\n"
+            for i in range(branches)
+        )
+        return f"class {cls_name}:\n    def handle(self, kind):\n{body}        return -1\n"
+
+    target = tmp_path / "mod.py"
+    target.write_text(handle("First", 4) + "\n" + handle("Second", 3))
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Second.handle grows to four branches: identical description to the
+    # pre-existing switch in First.handle, but a different qualified def.
+    target.write_text(handle("First", 4) + "\n" + handle("Second", 4))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f["smell_type"] == "type_switch"]
+    assert len(switches) == 1
+
+
+def test_unresolved_base_in_hierarchy_silences_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from somewhere import External\n"
+        "\n"
+        "class Local:\n"
+        "    def render(self):\n"
+        "        return 'local'\n"
+        "\n"
+        "class Child(External, Local):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_exiting_enclosing_loop_from_inner_loop_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def drain(queues):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        for q in queues:\n"
+        "            if q.empty():\n"
+        "                done = True\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_reports_finding_introduced_by_pure_deletion(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def f(ok):\n"
+        "    if ok:\n"
+        "        log()\n"
+        "    else:\n"
+        "        log()\n"
+        "        other()\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Deleting the else-branch's distinct final statement makes every branch
+    # end identically — a finding introduced purely by deletion.
+    target.write_text(
+        "def f(ok):\n"
+        "    if ok:\n"
+        "        log()\n"
+        "    else:\n"
+        "        log()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "duplicate_conditional_fragment" in found
+
+
+def test_analyze_diff_baseline_distinguishes_twin_ladders_in_one_def(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    def ladder(branches):
+        return "".join(
+            f"    {'if' if i == 0 else 'elif'} kind == '{chr(97 + i)}':\n        pass\n"
+            for i in range(branches)
+        )
+
+    target = tmp_path / "mod.py"
+    target.write_text("def f(kind):\n" + ladder(4) + ladder(3) + "    return kind\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # The second ladder in the SAME function grows to four branches: identical
+    # description and enclosing def as the first — only the ordinal differs.
+    target.write_text("def f(kind):\n" + ladder(4) + ladder(4) + "    return kind\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f.get("smell_type") == "type_switch"]
+    assert len(switches) == 1
+
+
+def test_private_decorator_on_dunder_is_still_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class C:\n"
+        "    @registry._private_hook\n"
+        "    def __init__(self):\n"
+        "        self.x = 1\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_assignment_away_from_termination_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def spin(q):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        if q.reset():\n"
+        "            done = False\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_mixed_eq_and_isinstance_ladder_is_not_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(value):\n"
+        "    if value == 0:\n"
+        "        return 1\n"
+        "    elif isinstance(value, str):\n"
+        "        return 2\n"
+        "    elif value == 3:\n"
+        "        return 3\n"
+        "    elif isinstance(value, bytes):\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_reports_temporary_field_introduced_by_method_edit(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        return 1\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Editing only run() introduces the temporary field; the finding anchors at
+    # the unchanged initializer line, outside the changed lines and def headers.
+    target.write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        log(self.scratch)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "temporary_field" in found
+
+
+def test_analyze_diff_line_mapping_beats_ordinal_shifts(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    def ladder(branches):
+        return "".join(
+            f"    {'if' if i == 0 else 'elif'} kind == '{chr(97 + i)}':\n        pass\n"
+            for i in range(branches)
+        )
+
+    target = tmp_path / "mod.py"
+    target.write_text("def f(kind):\n" + ladder(3) + ladder(4) + "    return kind\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # The EARLIER ladder grows to four branches: by rank it becomes ordinal 0,
+    # stealing the later pre-existing finding's baseline slot — line mapping
+    # must attribute the baseline finding to the later (unchanged) construct.
+    target.write_text("def f(kind):\n" + ladder(4) + ladder(4) + "    return kind\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f.get("smell_type") == "type_switch"]
+    assert len(switches) == 1 and switches[0]["line"] == 2
+
+
+def test_definition_order_resolves_base_bound_at_class_execution(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'module level'\n"
+        "\n"
+        "class Container:\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+        "\n"
+        "    class Base:\n"
+        "        pass\n"
+    )
+    # At execution time Child(Base) binds the concrete module-level Base — the
+    # later nested Base must not shadow it retroactively.
+    assert "refused_bequest" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_function_local_import_exempts_only_its_own_scope(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "helper = make_object()\n"
+        "\n"
+        "def uses_import():\n"
+        "    import registry as helper\n"
+        "    return helper._registry_internal\n"
+        "\n"
+        "def uses_module_object():\n"
+        "    return helper._secret\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 1 and "_secret" in findings[0]["description"]
+
+
+def test_inherited_usage_disqualifies_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def consume(self):\n"
+        "        return self.scratch\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        return self.scratch\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_while_else_loop_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def wait(jobs):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        if not jobs:\n"
+        "            done = True\n"
+        "    else:\n"
+        "        finish()\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_overload_declarations_are_not_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from typing import overload\n"
+        "\n"
+        "class Base:\n"
+        "    def convert(self, x):\n"
+        "        return x\n"
+        "\n"
+        "class Child(Base):\n"
+        "    @overload\n"
+        "    def convert(self, x: int) -> int: ...\n"
+        "    @overload\n"
+        "    def convert(self, x: str) -> str: ...\n"
+        "    def convert(self, x):\n"
+        "        return x * 2\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_baseline_keeps_test_directory_context(tmp_path):
+    _git(tmp_path, "init", "-q")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "helpers.py").write_text(
+        "def test_no_assert():\n"
+        "    x = 1\n"
+        "\n"
+        "def other():\n"
+        "    return 2\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Edit only other(): the pre-existing assertion-less test elsewhere in the
+    # file must not resurface — its baseline requires the tests/ context.
+    (tests_dir / "helpers.py").write_text(
+        "def test_no_assert():\n"
+        "    x = 1\n"
+        "\n"
+        "def other():\n"
+        "    return 3\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "test_without_assertion" not in found
+
+
+def test_analyze_diff_reports_refusal_introduced_by_base_edit(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        pass\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        pass\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Making Base.render concrete turns Child's unchanged no-op override into a
+    # refused bequest — a finding introduced outside the edited class's span.
+    target.write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'real'\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        pass\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "refused_bequest" in found
+
+
+def test_rebound_class_name_invalidates_base_resolution(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'class'\n"
+        "\n"
+        "Base = make_base()\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_lambda_and_comprehension_targets_shadow_module_names(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import account\n"
+        "\n"
+        "grab = lambda account: account._secret\n"
+        "\n"
+        "def collect(accounts):\n"
+        "    return [account._secret for account in accounts]\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 2
+
+
+def test_genexp_inside_dunder_keeps_dunder_exemption(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Vec:\n"
+        "    def __eq__(self, other):\n"
+        "        return all(a._v == b._v for a, b in zip(self._parts, other._parts))\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_call_result_receiver_is_intimacy_but_super_is_not(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class C(Base):\n"
+        "    def setup(self):\n"
+        "        super()._configure()\n"
+        "        return get_user()._token\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 1 and "_token" in findings[0]["description"]
+
+
+def test_name_mangled_attribute_outside_class_is_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def leak(other):\n"
+        "    return other.__secret\n"
+        "\n"
+        "class Account:\n"
+        "    def merge(self, other):\n"
+        "        return other.__balance\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    # Module level: foreign private state. Inside the class: mangling makes it
+    # same-class-only access by construction.
+    assert len(findings) == 1 and "__secret" in findings[0]["description"]
+
+
+def test_repeated_identical_conditions_are_not_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(kind):\n"
+        "    if kind == 1:\n"
+        "        return 1\n"
+        "    elif kind == 1:\n"
+        "        return 2\n"
+        "    elif kind == 1:\n"
+        "        return 3\n"
+        "    elif kind == 1:\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_reset_after_terminating_assignment_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def spin():\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        done = True\n"
+        "        done = False\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_gates_findings_on_lines_shifted_by_deletion(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def f():\n"
+        "    cleanup()\n"
+        "    try:\n"
+        "        g()\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Deleting cleanup() shifts the unchanged bare except onto a seeded line;
+    # the pre-existing bare_except must stay suppressed by the baseline.
+    target.write_text(
+        "def f():\n"
+        "    try:\n"
+        "        g()\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "bare_except" not in found
+
+
+def test_lambda_default_evaluates_in_enclosing_scope(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import account\n"
+        "\n"
+        "grab = lambda account=account._secret: account\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_module_rebinding_revokes_import_exemption(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import helper\n"
+        "\n"
+        "helper = make_object()\n"
+        "\n"
+        "def f():\n"
+        "    return helper._secret\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_class_defined_in_both_branches_is_ambiguous(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "if fast_mode():\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            pass\n"
+        "else:\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            return 'slow'\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_first_comprehension_iterable_evaluates_in_enclosing_scope(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import account\n"
+        "\n"
+        "def f():\n"
+        "    return [x for account in account._items for x in account]\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_class_decorator_evaluates_outside_class_context(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "@other.__private_hook\n"
+        "class C:\n"
+        "    def m(self):\n"
+        "        return 1\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_destructuring_write_populates_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch, status = make_pair()\n"
+        "        log(self.scratch)\n"
+        "        return status\n"
+    )
+    assert "temporary_field" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_same_named_methods_in_distinct_classes_do_not_collapse(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "class Outer1:\n"
+        "    class Child(Base):\n"
+        "        def run(self):\n"
+        "            self.scratch = object()\n"
+        "            return self.scratch\n"
+        "\n"
+        "class Outer2:\n"
+        "    class Child(Base):\n"
+        "        def run(self):\n"
+        "            self.scratch = object()\n"
+        "            return self.scratch\n"
+    )
+    # Two distinct Child.run methods use the field — not confined to one.
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_pure_rename_out_of_tests_is_analyzed(tmp_path):
+    _git(tmp_path, "init", "-q")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "account.py").write_text(
+        "def check(account):\n"
+        "    return account._token\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    _git(tmp_path, "mv", "tests/account.py", "src/account.py")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    # In tests/ the private access was exempt; as production code it's a
+    # finding the (pure) rename introduced.
+    assert "inappropriate_intimacy" in found
+
+
 def test_abstract_stub_with_imported_base_is_not_refused_bequest(tmp_path):
     (tmp_path / "sample.py").write_text(
         "from abc import ABC, abstractmethod\n"
